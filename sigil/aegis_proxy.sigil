@@ -1,0 +1,169 @@
+module aegis_proxy
+  targets server
+  trust none
+
+pub struct ProxyMetadata {
+  authority: Option<String>,
+  wire: Bytes,
+}
+
+pub fn authority(meta: &ProxyMetadata) -> Option<String>
+  intent "検証済みの SNI を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return meta.authority.clone();
+}
+
+pub fn preface(meta: &ProxyMetadata) -> Bytes
+  intent "検証済みの接続情報をそのまま渡す"
+  requires none
+  ensures none
+  effects none
+{
+  return meta.wire.clone();
+}
+
+fn u16(data: &Bytes, offset: Int) -> Int
+  intent "ネットワーク順の長さまたはポートを読む"
+  requires none
+  ensures none
+  effects none
+{
+  return data.get(offset).unwrap_or(0) * 256 + data.get(offset + 1).unwrap_or(0);
+}
+
+pub fn payload_size(head: &Bytes) -> Result<Int, Int>
+  intent "PROXY v2 の固定ヘッダーと長さを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let length = u16(&head, 14);
+  let family = head.get(13).unwrap_or(0);
+  if head.byte_len() != 16 || head.slice(0, 12).unwrap_or(Bytes.new()) != "\r\n\r\n\u{0}\r\nQUIT\n".as_bytes() || head.get(12).unwrap_or(0) != 33 {
+    return Err(400);
+  }
+  if (family != 17 && family != 33) || length > 1008 {
+    return Err(400);
+  }
+  return Ok(length);
+}
+
+fn dns_name(name: &Bytes) -> Bool
+  intent "正規化済みの DNS 名を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let size = name.byte_len();
+  if size == 0 || size > 253 {
+    return false;
+  }
+  let mut label = 0;
+  let mut prev = 0;
+  let mut has_letter = false;
+  let mut i = 0;
+  while i < size {
+    let c = name.get(i).unwrap_or(0);
+    let letter = c >= 97 && c <= 122;
+    has_letter = has_letter || letter;
+    let alnum = letter || (c >= 48 && c <= 57);
+    if c == 46 {
+      if label == 0 || prev == 45 {
+        return false;
+      }
+      label = 0;
+    } else {
+      if (!alnum && c != 45) || (label == 0 && c == 45) || label == 63 {
+        return false;
+      }
+      label = label + 1;
+    }
+    prev = c;
+    i = i + 1;
+  }
+  return label > 0 && prev != 45 && has_letter;
+}
+
+pub fn host_name(host: &Bytes) -> Result<String, Int>
+  intent "Host の DNS 名を小文字化しポートを取り除く"
+  requires none
+  ensures none
+  effects none
+{
+  let mut name = Bytes.new();
+  let mut i = 0;
+  while i < host.byte_len() && host.get(i).unwrap_or(0) != 58 {
+    let c = host.get(i).unwrap_or(0);
+    if c >= 65 && c <= 90 {
+      name.push(c + 32);
+    } else {
+      name.push(c);
+    }
+    i = i + 1;
+  }
+  if i < host.byte_len() {
+    i = i + 1;
+    let mut port = 0;
+    while i < host.byte_len() {
+      let digit = host.get(i).unwrap_or(0) - 48;
+      if digit < 0 || digit > 9 || port > 6553 {
+        return Err(400);
+      }
+      port = port * 10 + digit;
+      i = i + 1;
+    }
+    if port == 0 || port > 65535 {
+      return Err(400);
+    }
+  }
+  if !dns_name(&name) {
+    return Err(400);
+  }
+  return Ok(name.to_string_utf8().unwrap_or(""));
+}
+
+pub fn parse_proxy(head: &Bytes, payload: &Bytes) -> Result<ProxyMetadata, Int>
+  intent "アドレスと TLS の TLV を検証して接続情報を保持する"
+  requires none
+  ensures none
+  effects none
+{
+  let length = payload_size(&head)?;
+  let mut addr_len = 8;
+  if head.get(13).unwrap_or(0) == 33 {
+    addr_len = 32;
+  }
+  // IPv4 と IPv6 のアドレスは固定幅のネットワーク順バイト列。
+  if payload.byte_len() != length || length < addr_len + 4 || u16(&payload, addr_len) == 0 || u16(&payload, addr_len + 2) == 0 {
+    return Err(400);
+  }
+  let mut i = addr_len + 4;
+  let mut sni = None;
+  let mut tls = false;
+  while i < length {
+    let kind = payload.get(i).unwrap_or(0);
+    let size = u16(&payload, i + 1);
+    if length - i < 3 || size > length - i - 3 {
+      return Err(400);
+    }
+    i = i + 3;
+    let value = payload.slice(i, i + size).unwrap_or(Bytes.new());
+    if kind == 2 && sni.is_none() && dns_name(&value) {
+      sni = Some(value.to_string_utf8().unwrap_or(""));
+    } else if kind == 32 && !tls && value == "\u{1}\u{0}\u{0}\u{0}\u{0}!\u{0}\u{7}TLSv1.3".as_bytes() {
+      tls = true;
+    } else {
+      return Err(400);
+    }
+    i = i + size;
+  }
+  if !tls {
+    return Err(400);
+  }
+  let mut wire = head.clone();
+  wire.extend(&payload);
+  return Ok(ProxyMetadata { authority: sni, wire: wire });
+}
