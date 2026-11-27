@@ -1,0 +1,90 @@
+module aegis_routes
+  targets server
+  trust none
+
+use aegis_ip.valid_code;
+use aegis_policy.get_array_item;
+use aegis_policy.json_as_array;
+use aegis_policy.json_as_object;
+use aegis_policy.json_as_str;
+use aegis_policy.require_field;
+
+pub struct Route {
+  path: String,
+  id: String,
+}
+
+pub fn routes(data: &Bytes) -> Result<List<Route>, Int>
+  intent "Load a finite operator-defined exact-path route table."
+  requires none
+  ensures none
+  effects none
+{
+  if data.byte_len() > 65536 {
+    return Err(400);
+  }
+  let parsed = json.parse(&data).map_err(|error| 400)?;
+  let nodes = parsed.nodes();
+  let rows = json_as_array(&nodes, parsed.root())?;
+  if rows.len() > 64 {
+    return Err(400);
+  }
+  let mut configured: List<Route> = List.new();
+  let mut i = 0;
+  while i < rows.len() {
+    let row = json_as_object(&nodes, get_array_item(&rows, i)?)?;
+    if row.len() != 2 {
+      return Err(400);
+    }
+    let id = json_as_str(&nodes, require_field(&row, &"id")?)?;
+    let path = json_as_str(&nodes, require_field(&row, &"path")?)?;
+    let bytes = path.as_bytes();
+    if !valid_code(&id) || id == "default" || bytes.byte_len() > 8192 || bytes.get(0).unwrap_or(0) != 47 {
+      return Err(400);
+    }
+    let mut j = 0;
+    while j < bytes.byte_len() {
+      let c = bytes.get(j).unwrap_or(0);
+      if c <= 32 || c >= 127 || c == 63 || c == 35 {
+        return Err(400);
+      }
+      j = j + 1;
+    }
+    j = 0;
+    while j < configured.len() {
+      match configured.get(j) {
+        Some(route) => {
+          if route.path == path {
+            return Err(400);
+          }
+        }
+        None => {}
+      }
+      j = j + 1;
+    }
+    configured.push(Route { path: path, id: id });
+    i = i + 1;
+  }
+  return Ok(configured);
+}
+
+pub fn route_id(configured: &List<Route>, path: &String) -> String
+  intent "Return a configured ID or the common unclassified ID."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < configured.len() {
+    match configured.get(i) {
+      Some(route) => {
+        if route.path == path {
+          return route.id.clone();
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return "default";
+}

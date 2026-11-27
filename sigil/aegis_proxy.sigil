@@ -2,9 +2,22 @@ module aegis_proxy
   targets server
   trust none
 
+use aegis_ip.SourceIp;
+use aegis_ip.source_ip;
+
 pub struct ProxyMetadata {
+  source: SourceIp,
   authority: Option<String>,
   wire: Bytes,
+}
+
+pub fn source(meta: &ProxyMetadata) -> SourceIp
+  intent "Return the canonical source from the validated PROXY v2 preface."
+  requires none
+  ensures none
+  effects none
+{
+  return meta.source.clone();
 }
 
 pub fn authority(meta: &ProxyMetadata) -> Option<String>
@@ -168,5 +181,5 @@ pub fn parse_proxy(head: &Bytes, payload: &Bytes) -> Result<ProxyMetadata, Int>
   }
   let mut wire = head.clone();
   wire.extend(&payload);
-  return Ok(ProxyMetadata { authority: sni, wire: wire });
+  return Ok(ProxyMetadata { source: source_ip(&payload.slice(0, addr_len / 2).unwrap_or(Bytes.new())), authority: sni, wire: wire });
 }

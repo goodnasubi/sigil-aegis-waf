@@ -1,0 +1,32 @@
+module argus_collector
+  targets server
+  trust none
+
+use argus_receive.default_config;
+use argus_receive.listen_on;
+use argus_receive.open_hub;
+use argus_receive.serve;
+use argus_receive.share_hub;
+use argus_receive.with_listen;
+
+pub fn main() -> Int
+  intent "Start the pinned Argus receiver on an ephemeral test port."
+  requires none
+  ensures none
+  effects clock, console, env, fs, net.server, task
+{
+  let config = with_listen(default_config(env.get(&"ARGUS_TEST_DB").unwrap_or("argus-test")), "127.0.0.1", 0);
+  match open_hub(config.clone()) {
+    Ok(hub) => {
+      match listen_on(&config) {
+        Ok(listener) => {
+          console.log(&listener.local_port());
+          return serve(&listener, &share_hub(hub));
+        }
+        Err(_) => {}
+      }
+    }
+    Err(_) => {}
+  }
+  return 1;
+}

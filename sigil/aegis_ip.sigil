@@ -1,0 +1,380 @@
+module aegis_ip
+  targets server
+  trust none
+
+use aegis_policy.get_array_item;
+use aegis_policy.json_as_array;
+use aegis_policy.json_as_int;
+use aegis_policy.json_as_object;
+use aegis_policy.json_as_str;
+use aegis_policy.require_field;
+
+pub enum SourceIp {
+  V4(Bytes),
+  V6(Bytes),
+}
+
+pub fn source_ip(bytes: &Bytes) -> SourceIp
+  intent "Unify IPv4 and its IPv4-mapped IPv6 spelling."
+  requires none
+  ensures none
+  effects none
+{
+  if bytes.byte_len() == 4 {
+    return SourceIp.V4(bytes.clone());
+  }
+  let mut i = 0;
+  while i < 10 && bytes.get(i).unwrap_or(1) == 0 {
+    i = i + 1;
+  }
+  if i == 10 && bytes.get(10).unwrap_or(0) == 255 && bytes.get(11).unwrap_or(0) == 255 {
+    return SourceIp.V4(bytes.slice(12, 16).unwrap_or(Bytes.new()));
+  }
+  return SourceIp.V6(bytes.clone());
+}
+
+pub fn same_ip(left: &SourceIp, right: &SourceIp) -> Bool
+  intent "Compare addresses in canonical wire order and within their address family."
+  requires none
+  ensures none
+  effects none
+{
+  return prefix_matches(&left, &right, 128, true);
+}
+
+fn bytes_match(left: &Bytes, right: &Bytes, bits: Int) -> Bool
+  intent "Compare the leading bits of two addresses."
+  requires none
+  ensures none
+  effects none
+{
+  let whole = bits / 8;
+  let tail = bits % 8;
+  if left.slice(0, whole).unwrap_or(Bytes.new()) != right.slice(0, whole).unwrap_or(Bytes.new()) {
+    return false;
+  }
+  if tail == 0 {
+    return true;
+  }
+  let mut divisor = 1;
+  let mut i = tail;
+  while i < 8 {
+    divisor = divisor * 2;
+    i = i + 1;
+  }
+  return left.get(whole).unwrap_or(0) / divisor == right.get(whole).unwrap_or(0) / divisor;
+}
+
+fn prefix_matches(left: &SourceIp, right: &SourceIp, bits: Int, exact: Bool) -> Bool
+  intent "Match only addresses of the same canonical family."
+  requires none
+  ensures none
+  effects none
+{
+  match left {
+    SourceIp.V4(a) => {
+      match right {
+        SourceIp.V4(b) => {
+          return (exact && a == b) || (!exact && bytes_match(&a, &b, bits));
+        }
+        _ => {}
+      }
+    }
+    SourceIp.V6(a) => {
+      match right {
+        SourceIp.V6(b) => {
+          return (exact && a == b) || (!exact && bytes_match(&a, &b, bits));
+        }
+        _ => {}
+      }
+    }
+  }
+  return false;
+}
+
+pub struct Entry {
+  ip: SourceIp,
+  bits: Int,
+  block: Bool,
+  reason: String,
+  expires: Int,
+}
+
+pub struct IpTable {
+  version: String,
+  entries: List<Entry>,
+}
+
+pub enum IpEffect {
+  NoMatch,
+  Block(String),
+  Record(String),
+}
+
+pub fn ip_version(table: &IpTable) -> String
+  intent "Return the deployed IP table version."
+  requires none
+  ensures none
+  effects none
+{
+  return table.version.clone();
+}
+
+fn number(bytes: &Bytes, radix: Int, max_digits: Int) -> Result<Int, Int>
+  intent "Parse a bounded non-negative decimal or hexadecimal number."
+  requires none
+  ensures none
+  effects none
+{
+  if bytes.byte_len() == 0 || bytes.byte_len() > max_digits {
+    return Err(400);
+  }
+  let mut i = 0;
+  let mut parsed = 0;
+  while i < bytes.byte_len() {
+    let c = bytes.get(i).unwrap_or(0);
+    let mut digit = c - 48;
+    if c >= 65 && c <= 70 {
+      digit = c - 55;
+    } else if c >= 97 && c <= 102 {
+      digit = c - 87;
+    } else if c < 48 || c > 57 {
+      return Err(400);
+    }
+    if digit >= radix {
+      return Err(400);
+    }
+    parsed = parsed * radix + digit;
+    i = i + 1;
+  }
+  return Ok(parsed);
+}
+
+fn ipv4(text: &Bytes) -> Result<Bytes, Int>
+  intent "Parse four decimal octets."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parsed = Bytes.new();
+  let mut start = 0;
+  let mut i = 0;
+  while i <= text.byte_len() {
+    if i == text.byte_len() || text.get(i).unwrap_or(0) == 46 {
+      let part = text.slice(start, i).unwrap_or(Bytes.new());
+      let octet = number(&part, 10, 3)?;
+      if octet > 255 || (part.byte_len() > 1 && part.get(0).unwrap_or(0) == 48) {
+        return Err(400);
+      }
+      parsed.push(octet);
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  if parsed.byte_len() != 4 {
+    return Err(400);
+  }
+  return Ok(parsed);
+}
+
+fn ipv6(text: &Bytes) -> Result<Bytes, Int>
+  intent "Parse IPv6 hextets, optional zero compression and an optional final dotted quad."
+  requires none
+  ensures none
+  effects none
+{
+  let mut data = Bytes.new();
+  let mut gap = 0 - 1;
+  let mut i = 0;
+  while i < text.byte_len() {
+    if text.get(i).unwrap_or(0) == 58 {
+      if gap >= 0 || text.get(i + 1).unwrap_or(0) != 58 {
+        return Err(400);
+      }
+      gap = data.byte_len();
+      i = i + 2;
+    } else {
+      let start = i;
+      let mut dotted = false;
+      while i < text.byte_len() && text.get(i).unwrap_or(0) != 58 {
+        dotted = dotted || text.get(i).unwrap_or(0) == 46;
+        i = i + 1;
+      }
+      let part = text.slice(start, i).unwrap_or(Bytes.new());
+      if dotted {
+        if i != text.byte_len() {
+          return Err(400);
+        }
+        data.extend(&ipv4(&part)?);
+      } else {
+        let word = number(&part, 16, 4)?;
+        data.push(word / 256);
+        data.push(word % 256);
+      }
+      if i < text.byte_len() && text.get(i + 1).unwrap_or(0) != 58 {
+        i = i + 1;
+        if i == text.byte_len() {
+          return Err(400);
+        }
+      }
+    }
+  }
+  if gap < 0 {
+    if data.byte_len() == 16 {
+      return Ok(data);
+    }
+    return Err(400);
+  }
+  if data.byte_len() >= 16 {
+    return Err(400);
+  }
+  let mut parsed = data.slice(0, gap).unwrap_or(Bytes.new());
+  let mut zeros = 16 - data.byte_len();
+  while zeros > 0 {
+    parsed.push(0);
+    zeros = zeros - 1;
+  }
+  parsed.extend(&data.slice(gap, data.byte_len()).unwrap_or(Bytes.new()));
+  return Ok(parsed);
+}
+
+fn cidr(text: &String) -> Result<(SourceIp, Int), Int>
+  intent "Parse CIDR and translate mapped IPv6 prefixes to the equivalent IPv4 prefix."
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = text.as_bytes();
+  if bytes.byte_len() > 49 {
+    return Err(400);
+  }
+  let mut slash = 0;
+  let mut v6 = false;
+  while slash < bytes.byte_len() && bytes.get(slash).unwrap_or(0) != 47 {
+    v6 = v6 || bytes.get(slash).unwrap_or(0) == 58;
+    slash = slash + 1;
+  }
+  let address = bytes.slice(0, slash).unwrap_or(Bytes.new());
+  let mut bits = number(&bytes.slice(slash + 1, bytes.byte_len()).unwrap_or(Bytes.new()), 10, 3)?;
+  if v6 {
+    let ip = source_ip(&ipv6(&address)?);
+    if bits > 128 {
+      return Err(400);
+    }
+    match ip {
+      SourceIp.V4(_) => {
+        if bits < 96 {
+          return Err(400);
+        }
+        bits = bits - 96;
+      }
+      _ => {}
+    }
+    return Ok((ip, bits));
+  }
+  if bits > 32 {
+    return Err(400);
+  }
+  return Ok((SourceIp.V4(ipv4(&address)?), bits));
+}
+
+pub fn valid_code(text: &String) -> Bool
+  intent "Validate a short operator-defined identifier for structured fields."
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = text.as_bytes();
+  if bytes.byte_len() == 0 || bytes.byte_len() > 64 {
+    return false;
+  }
+  let mut i = 0;
+  while i < bytes.byte_len() {
+    let c = bytes.get(i).unwrap_or(0);
+    if !(c >= 97 && c <= 122) && !(c >= 48 && c <= 57) && c != 45 && c != 95 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn parse_ip_table(data: &Bytes) -> Result<IpTable, Int>
+  intent "Validate the entire deployed table, rejecting duplicate ranges and invalid expiry."
+  requires none
+  ensures none
+  effects none
+{
+  if data.byte_len() > 65536 {
+    return Err(400);
+  }
+  let root = json.parse(&data).map_err(|error| 400)?;
+  let nodes = root.nodes();
+  let fields = json_as_object(&nodes, root.root())?;
+  if fields.len() != 2 {
+    return Err(400);
+  }
+  let version = json_as_str(&nodes, require_field(&fields, &"version")?)?;
+  let rows = json_as_array(&nodes, require_field(&fields, &"entries")?)?;
+  if !valid_code(&version) || rows.len() > 256 {
+    return Err(400);
+  }
+  let mut entries: List<Entry> = List.new();
+  let mut i = 0;
+  while i < rows.len() {
+    let row = json_as_object(&nodes, get_array_item(&rows, i)?)?;
+    if row.len() != 4 {
+      return Err(400);
+    }
+    let (ip, bits) = cidr(&json_as_str(&nodes, require_field(&row, &"cidr")?)?)?;
+    let effect = json_as_str(&nodes, require_field(&row, &"effect")?)?;
+    let reason = json_as_str(&nodes, require_field(&row, &"reason")?)?;
+    let expires = json_as_int(&nodes, require_field(&row, &"expires_at")?)?;
+    if (effect != "block" && effect != "record") || !valid_code(&reason) || expires < 1 || expires > 253402300799 {
+      return Err(400);
+    }
+    let mut j = 0;
+    while j < entries.len() {
+      match entries.get(j) {
+        Some(previous) => {
+          if previous.bits == bits && prefix_matches(&previous.ip, &ip, bits, false) {
+            return Err(400);
+          }
+        }
+        None => {}
+      }
+      j = j + 1;
+    }
+    entries.push(Entry { ip: ip, bits: bits, block: effect == "block", reason: reason, expires: expires });
+    i = i + 1;
+  }
+  return Ok(IpTable { version: version, entries: entries });
+}
+
+pub fn evaluate_ip(table: &IpTable, ip: &SourceIp, now: Int) -> IpEffect
+  intent "Choose the longest active matching prefix."
+  requires none
+  ensures none
+  effects none
+{
+  let mut best = 0 - 1;
+  let mut parsed = IpEffect.NoMatch;
+  let mut i = 0;
+  while i < table.entries.len() {
+    match table.entries.get(i) {
+      Some(entry) => {
+        if now < entry.expires && entry.bits > best && prefix_matches(&entry.ip, &ip, entry.bits, false) {
+          best = entry.bits;
+          if entry.block {
+            parsed = IpEffect.Block(entry.reason.clone());
+          } else {
+            parsed = IpEffect.Record(entry.reason.clone());
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return parsed;
+}

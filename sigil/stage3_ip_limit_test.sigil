@@ -1,0 +1,191 @@
+module stage3_ip_limit_test
+  targets server
+  trust none
+
+use aegis_ip.IpEffect;
+use aegis_ip.evaluate_ip;
+use aegis_ip.parse_ip_table;
+use aegis_ip.same_ip;
+use aegis_ip.source_ip;
+use aegis_limit.Admission;
+use aegis_limit.admit;
+use aegis_limit.admit_at;
+use aegis_limit.limiter;
+use aegis_limit.limits;
+
+fn limiter_result(admission: Admission) -> Int
+  intent "Encode admission and the Retry-After value for assertions."
+  requires none
+  ensures none
+  effects none
+{
+  return match admission {
+    Admission.Allow => 200,
+    Admission.Limited(seconds) => seconds,
+    Admission.Unavailable => 503,
+  };
+}
+
+fn refill_and_capacity() -> Int
+  intent "Check mapped keys, transactional token consumption, expiry, and table capacity with a fixed clock."
+  requires none
+  ensures none
+  effects none
+{
+  let v4 = source_ip(&"abcd".as_bytes());
+  let v6 = source_ip(&"abcdefghijklmnop".as_bytes());
+  if same_ip(&v4, &v6) {
+    return 1;
+  }
+  let mut mapped_bytes = "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}".as_bytes();
+  mapped_bytes.push(255);
+  mapped_bytes.push(255);
+  mapped_bytes.extend(&"abcd".as_bytes());
+  let equivalent = source_ip(&mapped_bytes);
+  let other = source_ip(&"efgh".as_bytes());
+  match limits(1, 2, 1, 1, 1) {
+    Some(config) => {
+      let mut counters = limiter(config);
+      if limiter_result(admit_at(&mut counters, &v4, &"route", 0)) != 200 {
+        return 2;
+      }
+      if limiter_result(admit_at(&mut counters, &equivalent, &"route", 0)) != 1 {
+        return 3;
+      }
+      if limiter_result(admit_at(&mut counters, &other, &"route", 999999999)) != 503 {
+        return 4;
+      }
+      if limiter_result(admit_at(&mut counters, &v4, &"route", 999999999)) != 1 {
+        return 5;
+      }
+      if limiter_result(admit_at(&mut counters, &other, &"route", 1000000000)) != 200 {
+        return 6;
+      }
+    }
+    None => {
+      return 7;
+    }
+  }
+  match limits(1, 1, 1, 1, 2) {
+    Some(config) => {
+      let mut counters = limiter(config);
+      let _ = admit_at(&mut counters, &v4, &"route", 0);
+      if limiter_result(admit_at(&mut counters, &other, &"route", 0)) != 1 || limiter_result(admit_at(&mut counters, &other, &"route", 1000000000)) != 200 {
+        return 8;
+      }
+    }
+    None => {
+      return 9;
+    }
+  }
+  return 0;
+}
+
+fn parallel() -> Int
+  intent "Race for a single node token across two route keys."
+  requires none
+  ensures none
+  effects task
+{
+  match limits(1, 1, 1, 1, 2) {
+    Some(config) => {
+      let counters = SyncShared.new(Lock.new(limiter(config)));
+      return task.scope(|scope| {
+        let first_state = counters.clone();
+        let second = counters.clone();
+        let first = scope.spawn(move || limiter_result(admit(first_state.borrow(), &source_ip(&"abcd".as_bytes()), &"first", 0)));
+        let other = scope.spawn(move || limiter_result(admit(second.borrow(), &source_ip(&"abcd".as_bytes()), &"second", 0)));
+        if first.join() + other.join() == 201 {
+          return 0;
+        }
+        return 10;
+      });
+    }
+    None => {
+      return 11;
+    }
+  }
+}
+
+fn ip_expiry() -> Int
+  intent "Check longest active CIDR match and conflict rejection across mapped prefixes."
+  requires none
+  ensures none
+  effects none
+{
+  let data = "{\"version\":\"v1\",\"entries\":[{\"cidr\":\"192.0.2.0/24\",\"effect\":\"block\",\"reason\":\"broad\",\"expires_at\":20},{\"cidr\":\"::ffff:192.0.2.1/128\",\"effect\":\"record\",\"reason\":\"specific\",\"expires_at\":10},{\"cidr\":\"2001:db8::/32\",\"effect\":\"block\",\"reason\":\"v6\",\"expires_at\":30}]}".as_bytes();
+  let conflict = "{\"version\":\"v1\",\"entries\":[{\"cidr\":\"192.0.2.0/24\",\"effect\":\"block\",\"reason\":\"broad\",\"expires_at\":20},{\"cidr\":\"::ffff:192.0.2.1/120\",\"effect\":\"record\",\"reason\":\"specific\",\"expires_at\":10}]}".as_bytes();
+  if !parse_ip_table(&conflict).is_err() {
+    return 12;
+  }
+  let mut bytes = Bytes.new();
+  bytes.push(192);
+  bytes.push(0);
+  bytes.push(2);
+  bytes.push(1);
+  let ip = source_ip(&bytes);
+  match parse_ip_table(&data) {
+    Ok(table) => {
+      match evaluate_ip(&table, &ip, 9) {
+        IpEffect.Record(reason) => {
+          if reason != "specific" {
+            return 13;
+          }
+        }
+        _ => {
+          return 14;
+        }
+      }
+      match evaluate_ip(&table, &ip, 10) {
+        IpEffect.Block(reason) => {
+          if reason != "broad" {
+            return 15;
+          }
+        }
+        _ => {
+          return 16;
+        }
+      }
+      match evaluate_ip(&table, &ip, 20) {
+        IpEffect.NoMatch => {}
+        _ => {
+          return 17;
+        }
+      }
+      let mut v6 = " \u{1}\r".as_bytes();
+      v6.push(184);
+      v6.extend(&"abcdefghijkl".as_bytes());
+      match evaluate_ip(&table, &source_ip(&v6), 29) {
+        IpEffect.Block(reason) => {
+          if reason != "v6" {
+            return 18;
+          }
+        }
+        _ => {
+          return 19;
+        }
+      }
+    }
+    Err(_) => {
+      return 20;
+    }
+  }
+  return 0;
+}
+
+pub fn main() -> Int
+  intent "Run stage 3 IP and token bucket tests with injected time."
+  requires none
+  ensures none
+  effects task
+{
+  let refill = refill_and_capacity();
+  if refill != 0 {
+    return refill;
+  }
+  let ip = ip_expiry();
+  if ip != 0 {
+    return ip;
+  }
+  return parallel();
+}

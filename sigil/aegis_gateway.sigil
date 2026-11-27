@@ -3,10 +3,34 @@ module aegis_gateway
   trust none
 
 use aegis_http.check_request;
+use aegis_ip.IpTable;
+use aegis_ip.ip_version;
+use aegis_ip.parse_ip_table;
+use aegis_observe.Observer;
+use aegis_observe.enqueue;
+use aegis_observe.event;
+use aegis_observe.observer;
+use aegis_observe.run;
+use aegis_policy.Policy;
+use aegis_policy.default_managed_policy;
 use aegis_proxy.ProxyMetadata;
 use aegis_proxy.parse_proxy;
 use aegis_proxy.payload_size;
 use aegis_proxy.preface;
+use aegis_routes.Route;
+use aegis_routes.routes;
+
+struct Config {
+  ip_table: IpTable,
+  policy: Policy,
+  routes: List<Route>,
+  telemetry: Observer,
+}
+
+struct Session {
+  stream: TcpStream,
+  config: SyncShared<Config>,
+}
 
 fn read_exact(stream: &TcpStream, length: Int) -> Result<Bytes, Int>
   intent "PROXY ヘッダーに必要なバイトだけを読む"
@@ -172,11 +196,11 @@ fn relay_response(stream: &TcpStream, origin: &mut TcpClient, first: &Bytes)
   }
 }
 
-fn handle(stream: &TcpStream, upstream_port: Int)
+fn handle(stream: &TcpStream, upstream_port: Int, config: &Config)
   intent "接続元と要求を検査してから上流へ接続する"
   requires none
   ensures none
-  effects clock, console, net, task.spawn, task.suspend
+  effects clock, net, task
 {
   match stream.peer_addr() {
     Ok((ip, _)) => {
@@ -192,8 +216,26 @@ fn handle(stream: &TcpStream, upstream_port: Int)
     Some(Ok(meta)) => {
       match task.timeout(30000, || read_request(&stream)) {
         Some(Ok(req)) => {
-          let now = clock.unix_seconds().unwrap_or(0);
-          match task.timeout(10, || check_request(&req, &meta, now)) {
+          enqueue(&config.telemetry, event("pass", "", "", "default", "", true, false));
+          let wall = clock.unix_seconds();
+          if wall.is_none() {
+            send_error(&stream, 503);
+            return;
+          }
+          let now = wall.unwrap_or(0);
+          let mut observations = List.new();
+          let decision = task.timeout(10, || check_request(&req, &meta, now, &config.ip_table, &config.policy, &config.routes, &mut observations));
+          let mut i = 0;
+          while i < observations.len() {
+            match observations.get(i) {
+              Some(item) => {
+                enqueue(&config.telemetry, item.clone());
+              }
+              None => {}
+            }
+            i = i + 1;
+          }
+          match decision {
             Some(Ok(wire)) => {
               upstream(&stream, upstream_port, &meta, &wire);
             }
@@ -201,14 +243,17 @@ fn handle(stream: &TcpStream, upstream_port: Int)
               send_error(&stream, status);
             }
             None => {
+              enqueue(&config.telemetry, event("reject", "decision_timeout", "", "default", config.policy.version(), false, false));
               send_error(&stream, 503);
             }
           }
         }
         Some(Err(status)) => {
+          enqueue(&config.telemetry, event("reject", "http_invalid", "", "default", "", true, false));
           send_error(&stream, status);
         }
         None => {
+          enqueue(&config.telemetry, event("reject", "request_timeout", "", "default", "", true, false));
           send_error(&stream, 408);
         }
       }
@@ -221,25 +266,61 @@ pub fn main() -> Int
   intent "専用ループバックリスナーで WAF を起動する"
   requires none
   ensures none
-  effects clock, console, env, net, task.spawn, task.suspend
+  effects clock, console, env, net, task
 {
   let port = env.get(&"AEGIS_PORT").unwrap_or("8080").parse_int().unwrap_or(0 - 1);
   let upstream_port = env.get(&"AEGIS_UPSTREAM_PORT").unwrap_or("8081").parse_int().unwrap_or(0 - 1);
   if port < 0 || port > 65535 || upstream_port < 1 || upstream_port > 65535 || port == upstream_port {
     return 1;
   }
+  let table = env.get(&"AEGIS_IP_TABLE").unwrap_or("{\"version\":\"empty-v1\",\"entries\":[]}");
+  let argus_port = env.get(&"AEGIS_ARGUS_PORT").unwrap_or("0").parse_int().unwrap_or(0 - 1);
+  let queue = env.get(&"AEGIS_TELEMETRY_CAPACITY").unwrap_or("128").parse_int().unwrap_or(0);
+  let route_data = env.get(&"AEGIS_ROUTES").unwrap_or("[]");
+  if argus_port < 0 || argus_port > 65535 || queue < 1 || queue > 4096 {
+    return 1;
+  }
+  return match configure(&table.as_bytes(), &route_data.as_bytes(), argus_port, queue) {
+    Ok(validated) => serve(port, upstream_port, validated),
+    Err(_) => 1,
+  };
+}
+
+fn configure(table: &Bytes, route_data: &Bytes, argus_port: Int, capacity: Int) -> Result<Config, Int>
+  intent "Validate the complete IP and route configuration before listening."
+  requires none
+  ensures none
+  effects none
+{
+  return Ok(Config { ip_table: parse_ip_table(&table)?, policy: default_managed_policy(), routes: routes(&route_data)?, telemetry: observer(argus_port, capacity) });
+}
+
+fn serve(port: Int, upstream_port: Int, config: Config) -> Int
+  intent "Serve only after validating the deployed configuration."
+  requires none
+  ensures none
+  effects clock, console, net, task
+{
+  let shared = SyncShared.new(config);
   match net.listen(&"127.0.0.1", port, 128) {
     Ok(listener) => {
       console.log(&listener.local_port());
-      return task.roots(64, |g| {
+      return task.roots(65, |g| {
+        let deployed = shared.borrow();
+        let sender = g.reserve();
+        sender.start(shared.clone(), move |worker| {
+          let _ = run(&worker.borrow().telemetry);
+        }, move |worker| {});
+        enqueue(&deployed.telemetry, event("update", "policy_loaded", "", "default", deployed.policy.version(), false, false));
+        enqueue(&deployed.telemetry, event("update", "ip_table_loaded", "", "default", ip_version(&deployed.ip_table), false, false));
         let mut accepting = true;
         while accepting {
           let slot = g.reserve();
           match listener.accept() {
             Ok(stream) => {
-              slot.start(stream, move |client| {
-                handle(&client, upstream_port);
-              }, move |client| {});
+              slot.start(Session { stream: stream, config: shared.clone() }, move |session| {
+                handle(&session.stream, upstream_port, session.config.borrow());
+              }, move |session| {});
             }
             Err(_) => {
               accepting = false;
