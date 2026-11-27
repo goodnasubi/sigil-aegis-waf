@@ -1,0 +1,488 @@
+module stage1_policy_test
+  targets server
+  trust none
+
+// ADR 0068 決定 7（第1段: ポリシーと検査の核）完了条件の検証
+// 1. 同じ入力・版での結果の一致（決定性）
+// 2. 作用の優先順（遮断 > 追加確認 > 記録のみ > 通過）
+// 3. 期限切れの例外が作用しないこと（有効期限内は降格、期限切れ後は無効）
+// 4. 不正な設定を読み込んだときに直前の有効版が保持されること（原子的差し替え）
+// 5. マネージド基本ルールの検知と通常要求の通過
+
+use aegis_policy.Action;
+use aegis_policy.AegisEngine;
+use aegis_policy.Exception;
+use aegis_policy.FieldTarget;
+use aegis_policy.Header;
+use aegis_policy.Operator;
+use aegis_policy.Policy;
+use aegis_policy.RequestInput;
+use aegis_policy.Rule;
+use aegis_policy.default_managed_policy;
+use aegis_policy.err_duplicate_id;
+use aegis_policy.err_json_syntax;
+use aegis_policy.err_unknown_field;
+use aegis_policy.evaluate;
+
+fn make_request(method: String, path: String, query: String, route_id: String) -> RequestInput
+  intent "試験用の基本リクエスト入力を組み立てる"
+  requires none
+  ensures none
+  effects none
+{
+  return RequestInput.new(method, path, query, List.new(), Bytes.new(), route_id);
+}
+
+fn test_determinism() -> Int
+  intent "同じ入力・版・時刻での結果の完全一致（決定論性）を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let policy = default_managed_policy();
+  let exceptions = List.new();
+  let input = make_request("GET", "/test/path", "union select 1", "api-v1");
+  let now = 1700000000;
+
+  let dec1 = evaluate(&policy, &exceptions, &input, now);
+  let dec2 = evaluate(&policy, &exceptions, &input, now);
+
+  // 作用の一致確認
+  match dec1.action() {
+    Action.Block => {}
+    _ => {
+      return 101;
+    }
+  }
+  match dec2.action() {
+    Action.Block => {}
+    _ => {
+      return 102;
+    }
+  }
+
+  // ルール ID の一致確認
+  match dec1.matched_rule_id() {
+    Some(id1) => {
+      match dec2.matched_rule_id() {
+        Some(id2) => {
+          if id1 != id2 || id1 != "mgr-block-sqli-union" {
+            return 103;
+          }
+        }
+        None => {
+          return 104;
+        }
+      }
+    }
+    None => {
+      return 105;
+    }
+  }
+
+  // バージョンの一致確認
+  if dec1.policy_version() != dec2.policy_version() {
+    return 106;
+  }
+  if dec1.policy_version() != "2026-11-28-v1" {
+    return 107;
+  }
+
+  return 0;
+}
+
+fn test_action_priority() -> Int
+  intent "作用の優先順（遮断 > 追加確認 > 記録のみ > 通過）を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. Block, Challenge, LogOnly が同時にマッチする場合 -> Block
+  let mut rules_all = List.new();
+  rules_all.push(Rule.new("rule-log", None, FieldTarget.TargetPath, Operator.Prefix, "/test", List.new(), Action.LogOnly, "log rule"));
+  rules_all.push(Rule.new("rule-block", None, FieldTarget.TargetMethod, Operator.Exact, "POST", List.new(), Action.Block, "block rule"));
+  rules_all.push(Rule.new("rule-challenge", None, FieldTarget.TargetQuery, Operator.Contains, "auth", List.new(), Action.Challenge, "challenge rule"));
+  let pol_all = Policy.new("p-priority", rules_all);
+  let empty_ex = List.new();
+  let input_all = make_request("POST", "/test/sub", "auth=true", "r1");
+  let dec_all = evaluate(&pol_all, &empty_ex, &input_all, 1000);
+  match dec_all.action() {
+    Action.Block => {}
+    _ => {
+      return 201;
+    }
+  }
+
+  // 2. Challenge と LogOnly が同時にマッチする場合 -> Challenge
+  let mut rules_chal_log = List.new();
+  rules_chal_log.push(Rule.new("rule-log", None, FieldTarget.TargetPath, Operator.Prefix, "/test", List.new(), Action.LogOnly, "log rule"));
+  rules_chal_log.push(Rule.new("rule-challenge", None, FieldTarget.TargetQuery, Operator.Contains, "auth", List.new(), Action.Challenge, "challenge rule"));
+  let pol_cl = Policy.new("p-priority-2", rules_chal_log);
+  let input_cl = make_request("GET", "/test/sub", "auth=true", "r1");
+  let dec_cl = evaluate(&pol_cl, &empty_ex, &input_cl, 1000);
+  match dec_cl.action() {
+    Action.Challenge => {}
+    _ => {
+      return 202;
+    }
+  }
+
+  // 3. LogOnly のみがマッチする場合 -> LogOnly
+  let input_log = make_request("GET", "/test/sub", "id=1", "r1");
+  let dec_log = evaluate(&pol_cl, &empty_ex, &input_log, 1000);
+  match dec_log.action() {
+    Action.LogOnly => {}
+    _ => {
+      return 203;
+    }
+  }
+
+  // 4. マッチしない場合 -> Pass
+  let input_pass = make_request("GET", "/other", "id=1", "r1");
+  let dec_pass = evaluate(&pol_cl, &empty_ex, &input_pass, 1000);
+  match dec_pass.action() {
+    Action.Pass => {}
+    _ => {
+      return 204;
+    }
+  }
+
+  return 0;
+}
+
+fn test_exceptions() -> Int
+  intent "例外の動作（期限内降格、期限切れ無効、経路ID一致）を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let policy = default_managed_policy();
+  let rule_id = "mgr-block-sqli-union";
+  let target_route = "api-v1";
+  let other_route = "api-v2";
+  let expires_at = 2000000000;
+
+  let mut exceptions = List.new();
+  exceptions.push(Exception.new(rule_id, target_route.clone(), "false positive in search", expires_at));
+
+  let req_matched_route = make_request("GET", "/search", "union select 1", target_route);
+  let req_other_route = make_request("GET", "/search", "union select 1", other_route);
+
+  // Case 1: 有効期限内（now < expires_at）かつ route_id 一致 -> Block が LogOnly に降格される
+  let dec_active = evaluate(&policy, &exceptions, &req_matched_route, 1999999999);
+  match dec_active.action() {
+    Action.LogOnly => {}
+    _ => {
+      return 301;
+    }
+  }
+  match dec_active.reason() {
+    Some(r) => {
+      if r != "exception applied: false positive in search" {
+        return 302;
+      }
+    }
+    None => {
+      return 303;
+    }
+  }
+
+  // Case 2: 期限切れ（now >= expires_at） -> 例外は作用せず Block のまま
+  let dec_expired = evaluate(&policy, &exceptions, &req_matched_route, 2000000000);
+  match dec_expired.action() {
+    Action.Block => {}
+    _ => {
+      return 304;
+    }
+  }
+
+  // Case 3: 異なる route_id -> 例外は作用せず Block のまま
+  let dec_diff_route = evaluate(&policy, &exceptions, &req_other_route, 1999999999);
+  match dec_diff_route.action() {
+    Action.Block => {}
+    _ => {
+      return 305;
+    }
+  }
+
+  return 0;
+}
+
+fn test_atomic_reload() -> Int
+  intent "不正な設定読み込み時に直前の有効版が保持される原子的差し替えを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let initial_policy = default_managed_policy();
+  let mut engine = AegisEngine.new(initial_policy, List.new());
+
+  let test_req = make_request("TRACE", "/index.html", "", "default");
+
+  // 初期版で TRACE が Block されることを確認
+  let dec1 = engine.inspect(&test_req, 1000);
+  match dec1.action() {
+    Action.Block => {}
+    _ => {
+      return 401;
+    }
+  }
+  if dec1.policy_version() != "2026-11-28-v1" {
+    return 402;
+  }
+
+  // 不正 JSON 1: 構文エラー
+  let bad_json_syntax = "{\"version\": \"v2\", rules: [".as_bytes();
+  let res1 = engine.reload_policy(&bad_json_syntax);
+  match res1 {
+    Err(code) => {
+      if code != err_json_syntax() {
+        return 404;
+      }
+    }
+    Ok(_) => {
+      return 403;
+    }
+  }
+
+  // 不正リロード後も直前の版（v1）が保持され、TRACE が Block されること
+  let dec2 = engine.inspect(&test_req, 1000);
+  match dec2.action() {
+    Action.Block => {}
+    _ => {
+      return 405;
+    }
+  }
+  if dec2.policy_version() != "2026-11-28-v1" {
+    return 406;
+  }
+
+  // 不正 JSON 2: 未知項目
+  let bad_json_unknown = "{\"version\":\"v2\",\"unknown_field\":true,\"rules\":[]}".as_bytes();
+  let res2 = engine.reload_policy(&bad_json_unknown);
+  match res2 {
+    Err(code) => {
+      if code != err_unknown_field() {
+        return 408;
+      }
+    }
+    Ok(_) => {
+      return 407;
+    }
+  }
+
+  // 直前の版（v1）が保持されていること
+  let dec3 = engine.inspect(&test_req, 1000);
+  match dec3.action() {
+    Action.Block => {}
+    _ => {
+      return 409;
+    }
+  }
+  if dec3.policy_version() != "2026-11-28-v1" {
+    return 410;
+  }
+
+  // 不正 JSON 3: 重複ルール ID
+  let bad_json_dup = "{\"version\":\"v2\",\"rules\":[{\"id\":\"r1\",\"field\":\"method\",\"op\":\"exact\",\"value\":\"GET\",\"action\":\"block\"},{\"id\":\"r1\",\"field\":\"method\",\"op\":\"exact\",\"value\":\"POST\",\"action\":\"block\"}]}".as_bytes();
+  let res3 = engine.reload_policy(&bad_json_dup);
+  match res3 {
+    Err(code) => {
+      if code != err_duplicate_id() {
+        return 412;
+      }
+    }
+    Ok(_) => {
+      return 411;
+    }
+  }
+
+  // 直前の版（v1）が保持されていること
+  let dec4 = engine.inspect(&test_req, 1000);
+  match dec4.action() {
+    Action.Block => {}
+    _ => {
+      return 413;
+    }
+  }
+  if dec4.policy_version() != "2026-11-28-v1" {
+    return 414;
+  }
+
+  // 正常な新ポリシー JSON (v2) による差し替え
+  let good_json = "{\"version\":\"2026-11-28-v2\",\"rules\":[{\"id\":\"new-block-post\",\"field\":\"method\",\"op\":\"exact\",\"value\":\"POST\",\"action\":\"block\",\"description\":\"block post\"}]}".as_bytes();
+  let res_good = engine.reload_policy(&good_json);
+  if res_good.is_err() {
+    return 415;
+  }
+
+  // 新ポリシーが有効になり、版が v2 に更新されていること
+  let post_req = make_request("POST", "/api", "", "default");
+  let dec5 = engine.inspect(&post_req, 1000);
+  match dec5.action() {
+    Action.Block => {}
+    _ => {
+      return 416;
+    }
+  }
+  if dec5.policy_version() != "2026-11-28-v2" {
+    return 417;
+  }
+
+  // v1 のルール（TRACE）は新ポリシーに含まれないため Pass すること
+  let dec6 = engine.inspect(&test_req, 1000);
+  match dec6.action() {
+    Action.Pass => {}
+    _ => {
+      return 418;
+    }
+  }
+
+  return 0;
+}
+
+fn test_managed_rules() -> Int
+  intent "マネージド基本ルールの各防御機能と通常要求の通過を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let policy = default_managed_policy();
+  let exceptions = List.new();
+  let now = 1000;
+
+  // 1. TRACE メソッド
+  let req_trace = make_request("TRACE", "/index.html", "", "api");
+  let d_trace = evaluate(&policy, &exceptions, &req_trace, now);
+  match d_trace.action() {
+    Action.Block => {}
+    _ => {
+      return 501;
+    }
+  }
+
+  // 2. パストラバーサル (/../)
+  let req_trav = make_request("GET", "/static/../../etc/passwd", "", "api");
+  let d_trav = evaluate(&policy, &exceptions, &req_trav, now);
+  match d_trav.action() {
+    Action.Block => {}
+    _ => {
+      return 502;
+    }
+  }
+
+  // 3. SQLi (union select)
+  let req_sqli = make_request("GET", "/items", "category=books union select password from users", "api");
+  let d_sqli = evaluate(&policy, &exceptions, &req_sqli, now);
+  match d_sqli.action() {
+    Action.Block => {}
+    _ => {
+      return 503;
+    }
+  }
+
+  // 4. XSS (<script)
+  let req_xss = make_request("GET", "/search", "q=<script>alert(1)</script>", "api");
+  let d_xss = evaluate(&policy, &exceptions, &req_xss, now);
+  match d_xss.action() {
+    Action.Block => {}
+    _ => {
+      return 504;
+    }
+  }
+
+  // 5. 通常のリクエスト -> Pass
+  let req_normal = make_request("GET", "/items/123", "page=1", "api");
+  let d_normal = evaluate(&policy, &exceptions, &req_normal, now);
+  match d_normal.action() {
+    Action.Pass => {}
+    _ => {
+      return 505;
+    }
+  }
+
+  return 0;
+}
+
+fn test_header_and_body_inspection() -> Int
+  intent "ヘッダー検査および本文検査の動作を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rules = List.new();
+  rules.push(Rule.new("block-bad-ua", None, FieldTarget.TargetHeader("User-Agent"), Operator.Contains, "sqlmap", List.new(), Action.Block, "automated tool blocked"));
+  rules.push(Rule.new("block-body-malware", None, FieldTarget.TargetBody, Operator.Contains, "MALWARE_PAYLOAD", List.new(), Action.Block, "payload blocked"));
+  let policy = Policy.new("p-hdr-body", rules);
+  let empty_ex = List.new();
+
+  // ヘッダーマッチの確認
+  let mut headers_bad = List.new();
+  headers_bad.push(Header.new("User-Agent", "sqlmap/1.5"));
+  let req_hdr = RequestInput.new("GET", "/", "", headers_bad, Bytes.new(), "r1");
+  let d_hdr = evaluate(&policy, &empty_ex, &req_hdr, 1000);
+  match d_hdr.action() {
+    Action.Block => {}
+    _ => {
+      return 601;
+    }
+  }
+
+  // 本文マッチの確認
+  let mut body_bad = Bytes.new();
+  let payload_bytes = "something MALWARE_PAYLOAD here".as_bytes();
+  let mut bi = 0;
+  while bi < payload_bytes.byte_len() {
+    body_bad.push(payload_bytes.get(bi).unwrap_or(0));
+    bi = bi + 1;
+  }
+  let req_body = RequestInput.new("POST", "/upload", "", List.new(), body_bad, "r1");
+  let d_body = evaluate(&policy, &empty_ex, &req_body, 1000);
+  match d_body.action() {
+    Action.Block => {}
+    _ => {
+      return 602;
+    }
+  }
+
+  return 0;
+}
+
+fn main() -> Int
+  intent "第1段の検証テストを実行する（0 は成功）"
+  requires none
+  ensures none
+  effects none
+{
+  let r_det = test_determinism();
+  if r_det != 0 {
+    return r_det;
+  }
+
+  let r_prio = test_action_priority();
+  if r_prio != 0 {
+    return r_prio;
+  }
+
+  let r_ex = test_exceptions();
+  if r_ex != 0 {
+    return r_ex;
+  }
+
+  let r_atom = test_atomic_reload();
+  if r_atom != 0 {
+    return r_atom;
+  }
+
+  let r_mgr = test_managed_rules();
+  if r_mgr != 0 {
+    return r_mgr;
+  }
+
+  let r_hb = test_header_and_body_inspection();
+  if r_hb != 0 {
+    return r_hb;
+  }
+
+  return 0;
+}
