@@ -1,0 +1,256 @@
+module aegis_gateway
+  targets server
+  trust none
+
+use aegis_http.check_request;
+use aegis_proxy.ProxyMetadata;
+use aegis_proxy.parse_proxy;
+use aegis_proxy.payload_size;
+use aegis_proxy.preface;
+
+fn read_exact(stream: &TcpStream, length: Int) -> Result<Bytes, Int>
+  intent "PROXY ヘッダーに必要なバイトだけを読む"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut data = Bytes.new();
+  while data.byte_len() < length {
+    match stream.read(length - data.byte_len()) {
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return Err(400);
+        }
+        data.extend(&chunk);
+      }
+      Err(_) => {
+        return Err(400);
+      }
+    }
+  }
+  return Ok(data);
+}
+
+fn read_proxy(stream: &TcpStream) -> Result<ProxyMetadata, Int>
+  intent "HTTP より先に接続情報を一度読む"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let head = read_exact(&stream, 16)?;
+  let size = payload_size(&head)?;
+  let payload = read_exact(&stream, size)?;
+  return parse_proxy(&head, &payload);
+}
+
+fn read_request(stream: &TcpStream) -> Result<HttpRequest, Int>
+  intent "標準の増分パーサーで HTTP 要求を一件読む"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut parser = http.parser(&http.default_limits());
+  let mut continued = false;
+  while true {
+    match stream.read(16384) {
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return Err(400);
+        }
+        match parser.feed(&chunk, 0) {
+          Ok(HttpProgress.Done(req, _)) => {
+            return Ok(req);
+          }
+          Ok(HttpProgress.NeedMore) => {}
+          Err(e) => {
+            return Err(e.status());
+          }
+        }
+        if !continued && parser.wants_continue() {
+          if stream.write_all(&"HTTP/1.1 100 Continue\r\n\r\n".as_bytes()).is_err() {
+            return Err(400);
+          }
+          continued = true;
+        }
+      }
+      Err(_) => {
+        return Err(400);
+      }
+    }
+  }
+  return Err(400);
+}
+
+fn send_error(stream: &TcpStream, status: Int)
+  intent "接続を閉じる定型 HTTP 応答を返す"
+  requires none
+  ensures none
+  effects clock, net.server, task.spawn, task.suspend
+{
+  let reason = match status {
+    403 => "403 Forbidden",
+    408 => "408 Request Timeout",
+    413 => "413 Content Too Large",
+    414 => "414 URI Too Long",
+    417 => "417 Expectation Failed",
+    421 => "421 Misdirected Request",
+    431 => "431 Request Header Fields Too Large",
+    501 => "501 Not Implemented",
+    502 => "502 Bad Gateway",
+    503 => "503 Service Unavailable",
+    505 => "505 HTTP Version Not Supported",
+    _ => "400 Bad Request",
+  };
+  let mut reply = "HTTP/1.1 ".as_bytes();
+  reply.extend(&reason.as_bytes());
+  reply.extend(&"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".as_bytes());
+  let _ = task.timeout(1000, || stream.write_all(&reply));
+}
+
+fn upstream(stream: &TcpStream, port: Int, meta: &ProxyMetadata, request: &Bytes)
+  intent "判定済みの要求と接続情報を専用の上流接続へ渡す"
+  requires none
+  ensures none
+  effects clock, net, task.spawn, task.suspend
+{
+  match task.timeout(10000, || start_upstream(port, &meta, &request)) {
+    Some(Ok((client, first))) => {
+      let mut origin = client;
+      let _ = task.timeout(30000, || relay_response(&stream, &mut origin, &first));
+    }
+    _ => {
+      send_error(&stream, 502);
+    }
+  }
+}
+
+fn start_upstream(port: Int, meta: &ProxyMetadata, request: &Bytes) -> Result<(TcpClient, Bytes), Int>
+  intent "上流に接続して最初の応答バイトを待つ"
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match net.connect(&"127.0.0.1", port) {
+    Ok(client) => {
+      let mut origin = client;
+      if origin.write_all(&preface(&meta)).is_err() || origin.write_all(&request).is_err() {
+        return Err(502);
+      }
+      match origin.read(16384) {
+        Ok(chunk) => {
+          if chunk.byte_len() > 0 {
+            return Ok((origin, chunk));
+          }
+        }
+        Err(_) => {}
+      }
+    }
+    Err(_) => {}
+  }
+  return Err(502);
+}
+
+fn relay_response(stream: &TcpStream, origin: &mut TcpClient, first: &Bytes)
+  intent "上流の応答を有限なバッファで中継する"
+  requires none
+  ensures none
+  effects net, task.suspend
+{
+  let mut chunk = first.clone();
+  while chunk.byte_len() > 0 {
+    if stream.write_all(&chunk).is_err() {
+      return;
+    }
+    match origin.read(16384) {
+      Ok(next) => {
+        chunk = next;
+      }
+      Err(_) => {
+        return;
+      }
+    }
+  }
+}
+
+fn handle(stream: &TcpStream, upstream_port: Int)
+  intent "接続元と要求を検査してから上流へ接続する"
+  requires none
+  ensures none
+  effects clock, console, net, task.spawn, task.suspend
+{
+  match stream.peer_addr() {
+    Ok((ip, _)) => {
+      if ip != "127.0.0.1" {
+        return;
+      }
+    }
+    Err(_) => {
+      return;
+    }
+  }
+  match task.timeout(1000, || read_proxy(&stream)) {
+    Some(Ok(meta)) => {
+      match task.timeout(30000, || read_request(&stream)) {
+        Some(Ok(req)) => {
+          let now = clock.unix_seconds().unwrap_or(0);
+          match task.timeout(10, || check_request(&req, &meta, now)) {
+            Some(Ok(wire)) => {
+              upstream(&stream, upstream_port, &meta, &wire);
+            }
+            Some(Err(status)) => {
+              send_error(&stream, status);
+            }
+            None => {
+              send_error(&stream, 503);
+            }
+          }
+        }
+        Some(Err(status)) => {
+          send_error(&stream, status);
+        }
+        None => {
+          send_error(&stream, 408);
+        }
+      }
+    }
+    _ => {}
+  }
+}
+
+pub fn main() -> Int
+  intent "専用ループバックリスナーで WAF を起動する"
+  requires none
+  ensures none
+  effects clock, console, env, net, task.spawn, task.suspend
+{
+  let port = env.get(&"AEGIS_PORT").unwrap_or("8080").parse_int().unwrap_or(0 - 1);
+  let upstream_port = env.get(&"AEGIS_UPSTREAM_PORT").unwrap_or("8081").parse_int().unwrap_or(0 - 1);
+  if port < 0 || port > 65535 || upstream_port < 1 || upstream_port > 65535 || port == upstream_port {
+    return 1;
+  }
+  match net.listen(&"127.0.0.1", port, 128) {
+    Ok(listener) => {
+      console.log(&listener.local_port());
+      return task.roots(64, |g| {
+        let mut accepting = true;
+        while accepting {
+          let slot = g.reserve();
+          match listener.accept() {
+            Ok(stream) => {
+              slot.start(stream, move |client| {
+                handle(&client, upstream_port);
+              }, move |client| {});
+            }
+            Err(_) => {
+              accepting = false;
+            }
+          }
+        }
+        return 1;
+      });
+    }
+    Err(_) => {
+      return 1;
+    }
+  }
+}

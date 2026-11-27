@@ -1,0 +1,158 @@
+module aegis_http
+  targets server
+  trust none
+
+use aegis_policy.Action;
+use aegis_policy.Header;
+use aegis_policy.RequestInput;
+use aegis_policy.default_managed_policy;
+use aegis_policy.evaluate;
+use aegis_policy.to_ascii_lower;
+use aegis_proxy.ProxyMetadata;
+use aegis_proxy.authority;
+use aegis_proxy.host_name;
+
+fn hop_header(name: &String) -> Bool
+  intent "転送しない接続・フレーミング・転送元の見出しを識別する"
+  requires none
+  ensures none
+  effects none
+{
+  return name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "proxy-authorization" || name == "proxy-authenticate" || name == "te" || name == "trailer" || name == "transfer-encoding" || name == "upgrade" || name == "content-length" || name == "expect" || name == "forwarded" || name.as_bytes().slice(0, 12).unwrap_or(Bytes.new()) == "x-forwarded-".as_bytes();
+}
+
+fn decimal(n: Int) -> Bytes
+  intent "転送する本文の長さを十進表記にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut digits = Bytes.new();
+  let mut factor = 1;
+  while n / factor >= 10 {
+    factor = factor * 10;
+  }
+  while factor > 0 {
+    digits.push(48 + n / factor % 10);
+    factor = factor / 10;
+  }
+  return digits;
+}
+
+pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int) -> Result<Bytes, Int>
+  intent "検査を終えた要求だけを一意のフレーミングで組み立てる"
+  requires none
+  ensures none
+  effects clock, console, task.suspend
+{
+  if req.version() != 11 {
+    return Err(505);
+  }
+  let host = req.header(&"host").unwrap_or(Bytes.new());
+  match authority(&meta) {
+    Some(sni) => {
+      match host_name(&host) {
+        Ok(name) => {
+          if sni != name {
+            return Err(421);
+          }
+        }
+        Err(_) => {
+          return Err(421);
+        }
+      }
+    }
+    None => {
+      if host.byte_len() == 0 {
+        return Err(400);
+      }
+    }
+  }
+
+  let path = req.path();
+  let query = req.query();
+  let path_text = path.to_string_utf8();
+  let query_text = query.to_string_utf8();
+  if path_text.is_err() || query_text.is_err() {
+    return Err(400);
+  }
+  let mut input_headers = List.new();
+  let mut wire_headers = Bytes.new();
+  let mut header_count = 1;  // Connection: close
+  let headers = req.headers();
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      Some(header) => {
+        let name = header.name();
+        let value = header.value();
+        let text = value.to_string_utf8();
+        if text.is_err() {
+          return Err(400);
+        }
+        let value_text = text.unwrap_or("");
+        if name == "connection" {
+          let option = to_ascii_lower(&value_text);
+          if option != "close" && option != "keep-alive" {
+            return Err(400);
+          }
+        }
+        input_headers.push(Header.new(name.clone(), value_text));
+        if !hop_header(&name) {
+          wire_headers.extend(&name.as_bytes());
+          wire_headers.extend(&": ".as_bytes());
+          wire_headers.extend(&value);
+          wire_headers.extend(&"\r\n".as_bytes());
+          header_count = header_count + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let body = req.body();
+  if body.byte_len() != 0 || req.header(&"content-length").is_some() || req.header(&"transfer-encoding").is_some() {
+    wire_headers.extend(&"content-length: ".as_bytes());
+    wire_headers.extend(&decimal(body.byte_len()));
+    wire_headers.extend(&"\r\n".as_bytes());
+    header_count = header_count + 1;
+  }
+  wire_headers.extend(&"connection: close\r\n".as_bytes());
+  let limits = http.default_limits();
+  if wire_headers.byte_len() > limits.head() || header_count > limits.headers() {
+    return Err(431);
+  }
+
+  let method = req.method();
+  let input = RequestInput.new(method.clone(), path_text.unwrap_or(""), query_text.unwrap_or(""), input_headers, body.clone(), "default");
+  // 期限をスケジューラーが処理できるよう、正規化と評価の間で中断する。
+  task.sleep(0);
+  let decision = evaluate(&default_managed_policy(), &List.new(), &input, now);
+  match decision.action() {
+    Action.Block => {
+      return Err(403);
+    }
+    Action.Challenge => {
+      console.log(&"challenge_required");
+      return Err(403);
+    }
+    Action.LogOnly => {
+      console.log(&"log_only");
+    }
+    Action.Pass => {}
+  }
+
+  let mut request = method.as_bytes();
+  request.extend(&" ".as_bytes());
+  request.extend(&path);
+  if query.byte_len() > 0 {
+    request.extend(&"?".as_bytes());
+    request.extend(&query);
+  }
+  request.extend(&" HTTP/1.1\r\n".as_bytes());
+  request.extend(&wire_headers);
+  request.extend(&"\r\n".as_bytes());
+  request.extend(&body);
+  task.sleep(0);
+  return Ok(request);
+}

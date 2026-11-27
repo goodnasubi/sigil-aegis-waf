@@ -2,6 +2,7 @@
 set -euo pipefail
 
 sigil_sha=e1a0291ab419dca0a04c9d7315c3567b81308a1f
+shield_sha=63d3051b18e6d0e90c1ebe8f76e6ce267d7534a4
 rust_version=1.100.0
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 scratch=$(mktemp -d)
@@ -59,4 +60,10 @@ run_entry() {
 
 run_entry stage1_policy_test "Stage 1 policy core"
 
-printf 'All Stage 1 policy core evaluator and native tests passed.\n'
+fetch_pinned https://github.com/goodnasubi/sigil-shield-tls.git "$shield_sha" "$scratch/shield"
+cp "$scratch/shield/sigil/shield_proxy_v2.sigil" "$repo_root/tests/shield_preface.sigil" "$root/"
+"$sigil" fmt --check "$repo_root/tests/shield_preface.sigil"
+"$sigil" check --root "$root" "$root/aegis_gateway.sigil"
+"$sigil" build --root "$root" "$root/aegis_gateway.sigil" main -o "$scratch/aegis"
+"$sigil" build --root "$root" "$root/shield_preface.sigil" main -o "$scratch/shield-preface"
+python3 "$repo_root/tests/stage2_loopback.py" "$scratch/aegis" "$scratch/shield-preface"
