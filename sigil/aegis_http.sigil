@@ -7,6 +7,7 @@ use aegis_policy.Header;
 use aegis_policy.RequestInput;
 use aegis_policy.default_managed_policy;
 use aegis_policy.evaluate;
+use aegis_policy.to_ascii_lower;
 use aegis_proxy.ProxyMetadata;
 use aegis_proxy.authority;
 use aegis_proxy.host_name;
@@ -90,8 +91,11 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int) -> Resul
           return Err(400);
         }
         let value_text = text.unwrap_or("");
-        if name == "connection" && value != "close".as_bytes() && value != "keep-alive".as_bytes() {
-          return Err(400);
+        if name == "connection" {
+          let option = to_ascii_lower(&value_text);
+          if option != "close" && option != "keep-alive" {
+            return Err(400);
+          }
         }
         input_headers.push(Header.new(name.clone(), value_text));
         if !hop_header(&name) {

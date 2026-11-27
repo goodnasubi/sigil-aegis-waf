@@ -144,9 +144,12 @@ pub fn parse_proxy(head: &Bytes, payload: &Bytes) -> Result<ProxyMetadata, Int>
   let mut sni = None;
   let mut tls = false;
   while i < length {
+    if length - i < 3 {
+      return Err(400);
+    }
     let kind = payload.get(i).unwrap_or(0);
     let size = u16(&payload, i + 1);
-    if length - i < 3 || size > length - i - 3 {
+    if size > length - i - 3 {
       return Err(400);
     }
     i = i + 3;

@@ -104,6 +104,13 @@ class Loopback(unittest.TestCase):
             b"bc\r\n0\r\n\r\n",
         )
 
+    def test_connection_tokens_are_case_insensitive(self):
+        request = b"GET / HTTP/1.1\r\nHost: example.test\r\n"
+        expected = b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n"
+        for token in (b"Keep-Alive", b"Close"):
+            with self.subTest(token=token):
+                self.forward(self.v4, request + b"Connection: " + token + b"\r\n\r\n", expected)
+
     def test_invalid_proxy_metadata(self):
         request = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"
         bad_port = self.v4[:24] + b"\x00\x00" + self.v4[26:]
@@ -113,6 +120,14 @@ class Loopback(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self.reject(prefix + request)
         self.reject(self.v4 + self.v4 + request, 400)
+
+    def test_short_proxy_tlv_header(self):
+        request = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"
+        for tail in (b"\x02", b"\x02\x00"):
+            with self.subTest(size=len(tail)):
+                payload = self.v4[16:] + tail
+                preface = self.v4[:14] + len(payload).to_bytes(2, "big") + payload
+                self.reject(preface + request)
 
     def test_http_rejections_never_connect(self):
         host = b"Host: example.test\r\n"
