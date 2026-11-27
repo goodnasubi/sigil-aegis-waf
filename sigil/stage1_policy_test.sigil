@@ -20,9 +20,11 @@ use aegis_policy.RequestInput;
 use aegis_policy.Rule;
 use aegis_policy.default_managed_policy;
 use aegis_policy.err_duplicate_id;
+use aegis_policy.err_invalid_value;
 use aegis_policy.err_json_syntax;
 use aegis_policy.err_unknown_field;
 use aegis_policy.evaluate;
+use aegis_policy.max_search_steps;
 
 fn make_request(method: String, path: String, query: String, route_id: String) -> RequestInput
   intent "試験用の基本リクエスト入力を組み立てる"
@@ -448,6 +450,135 @@ fn test_header_and_body_inspection() -> Int
   return 0;
 }
 
+fn test_budget_exhaustion_fail_closed() -> Int
+  intent "比較予算（100,000）超過時のフェイルクローズ（Block）を検証する（P1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rules = List.new();
+  rules.push(Rule.new("block-body-malware", None, FieldTarget.TargetBody, Operator.Contains, "MALWARE_PAYLOAD", List.new(), Action.Block, "payload blocked"));
+  let policy = Policy.new("p-budget-test", rules);
+  let empty_ex = List.new();
+
+  // 100,001 バイトの a の後に MALWARE_PAYLOAD を配置した本文
+  let mut body_evasion = Bytes.new();
+  let dummy_count = max_search_steps() + 1;
+  let mut i = 0;
+  while i < dummy_count {
+    body_evasion.push(97);
+    i = i + 1;
+  }
+  let payload_bytes = "MALWARE_PAYLOAD".as_bytes();
+  let mut j = 0;
+  while j < payload_bytes.byte_len() {
+    body_evasion.push(payload_bytes.get(j).unwrap_or(0));
+    j = j + 1;
+  }
+
+  let req = RequestInput.new("POST", "/data", "", List.new(), body_evasion, "r1");
+  let dec = evaluate(&policy, &empty_ex, &req, 1000);
+
+  // 予算枯渇によりフェイルクローズで Action.Block になること
+  match dec.action() {
+    Action.Block => {}
+    _ => {
+      return 701;
+    }
+  }
+
+  // ルール ID が記録されること
+  match dec.matched_rule_id() {
+    Some(rid) => {
+      if rid != "block-body-malware" {
+        return 702;
+      }
+    }
+    None => {
+      return 703;
+    }
+  }
+
+  return 0;
+}
+
+fn test_missing_value_rejected() -> Int
+  intent "set 以外の演算子で value が無い不完全な設定が拒否され、直前の有効版が保持されることを検証する（P2）"
+  requires none
+  ensures none
+  effects none
+{
+  let initial_policy = default_managed_policy();
+  let mut engine = AegisEngine.new(initial_policy, List.new());
+
+  // 1. contains で value が欠落している JSON
+  let bad_contains = "{\"version\":\"v-bad-1\",\"rules\":[{\"id\":\"r-bad-c\",\"field\":\"path\",\"op\":\"contains\",\"action\":\"block\"}]}".as_bytes();
+  let res1 = engine.reload_policy(&bad_contains);
+  match res1 {
+    Err(code) => {
+      if code != err_invalid_value() {
+        return 801;
+      }
+    }
+    Ok(_) => {
+      return 802;
+    }
+  }
+
+  // 2. exact で value が欠落している JSON
+  let bad_exact = "{\"version\":\"v-bad-2\",\"rules\":[{\"id\":\"r-bad-e\",\"field\":\"method\",\"op\":\"exact\",\"action\":\"block\"}]}".as_bytes();
+  let res2 = engine.reload_policy(&bad_exact);
+  match res2 {
+    Err(code) => {
+      if code != err_invalid_value() {
+        return 803;
+      }
+    }
+    Ok(_) => {
+      return 804;
+    }
+  }
+
+  // 3. prefix で value が欠落している JSON
+  let bad_prefix = "{\"version\":\"v-bad-3\",\"rules\":[{\"id\":\"r-bad-p\",\"field\":\"query\",\"op\":\"prefix\",\"action\":\"block\"}]}".as_bytes();
+  let res3 = engine.reload_policy(&bad_prefix);
+  match res3 {
+    Err(code) => {
+      if code != err_invalid_value() {
+        return 805;
+      }
+    }
+    Ok(_) => {
+      return 806;
+    }
+  }
+
+  // 4. 不正リロード後も直前の有効版（v1）が保持されていること
+  let test_req = make_request("TRACE", "/index.html", "", "default");
+  let dec = engine.inspect(&test_req, 1000);
+  match dec.action() {
+    Action.Block => {}
+    _ => {
+      return 807;
+    }
+  }
+  if dec.policy_version() != "2026-11-28-v1" {
+    return 808;
+  }
+
+  // 5. 明示的な空文字列 value は受け入れられること
+  let good_empty_val = "{\"version\":\"v-empty-val\",\"rules\":[{\"id\":\"r-empty\",\"field\":\"query\",\"op\":\"exact\",\"value\":\"\",\"action\":\"log_only\"}]}".as_bytes();
+  let res4 = engine.reload_policy(&good_empty_val);
+  if res4.is_err() {
+    return 809;
+  }
+  if engine.policy().version() != "v-empty-val" {
+    return 810;
+  }
+
+  return 0;
+}
+
 fn main() -> Int
   intent "第1段の検証テストを実行する（0 は成功）"
   requires none
@@ -482,6 +613,16 @@ fn main() -> Int
   let r_hb = test_header_and_body_inspection();
   if r_hb != 0 {
     return r_hb;
+  }
+
+  let r_p1 = test_budget_exhaustion_fail_closed();
+  if r_p1 != 0 {
+    return r_p1;
+  }
+
+  let r_p2 = test_missing_value_rejected();
+  if r_p2 != 0 {
+    return r_p2;
   }
 
   return 0;

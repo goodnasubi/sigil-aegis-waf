@@ -703,8 +703,8 @@ pub fn str_starts_with(s: &String, prefix: &String) -> Bool
   return true;
 }
 
-pub fn bytes_contains(haystack: &Bytes, needle: &String) -> Bool
-  intent "バイト列に needle の UTF-8 バイト列が含まれるか調べる（上限 100,000 比較）"
+pub fn bytes_contains(haystack: &Bytes, needle: &String) -> Result<Bool, Int>
+  intent "バイト列に needle の UTF-8 バイト列が含まれるか調べる（上限 100,000 比較、予算超過時はエラー）"
   requires none
   ensures none
   effects none
@@ -713,19 +713,20 @@ pub fn bytes_contains(haystack: &Bytes, needle: &String) -> Bool
   let n_len = n_bytes.byte_len();
   let h_len = haystack.byte_len();
   if n_len == 0 {
-    return true;
+    return Ok(true);
   }
   if h_len < n_len {
-    return false;
+    return Ok(false);
   }
   let max_start = h_len - n_len;
   let mut start = 0;
   let mut steps = 0;
   let mut found = false;
-  while start <= max_start && !found && steps <= max_search_steps() {
+  let limit = max_search_steps();
+  while start <= max_start && !found && steps <= limit {
     let mut j = 0;
     let mut matched = true;
-    while j < n_len && matched && steps <= max_search_steps() {
+    while j < n_len && matched && steps <= limit {
       steps = steps + 1;
       if haystack.get(start + j).unwrap_or(0) != n_bytes.get(j).unwrap_or(0) {
         matched = false;
@@ -739,11 +740,17 @@ pub fn bytes_contains(haystack: &Bytes, needle: &String) -> Bool
       start = start + 1;
     }
   }
-  return found;
+  if found {
+    return Ok(true);
+  }
+  if steps > limit {
+    return Err(err_limit_exceeded());
+  }
+  return Ok(false);
 }
 
-pub fn str_contains(haystack: &String, needle: &String) -> Bool
-  intent "文字列に needle が含まれるか調べる"
+pub fn str_contains(haystack: &String, needle: &String) -> Result<Bool, Int>
+  intent "文字列に needle が含まれるか調べる（上限 100,000 比較、予算超過時はエラー）"
   requires none
   ensures none
   effects none
@@ -773,7 +780,7 @@ pub fn to_ascii_lower(s: &String) -> String
   return out.to_string_utf8().unwrap_or(s.clone());
 }
 
-pub fn match_operator(op: &Operator, target: &String, value: &String, values: &List<String>) -> Bool
+pub fn match_operator(op: &Operator, target: &String, value: &String, values: &List<String>) -> Result<Bool, Int>
   intent "文字列対象に対する演算子を評価する"
   requires none
   ensures none
@@ -781,10 +788,10 @@ pub fn match_operator(op: &Operator, target: &String, value: &String, values: &L
 {
   match op {
     Operator.Exact => {
-      return target == value;
+      return Ok(target == value);
     }
     Operator.Prefix => {
-      return str_starts_with(&target, &value);
+      return Ok(str_starts_with(&target, &value));
     }
     Operator.Contains => {
       return str_contains(&target, &value);
@@ -796,14 +803,14 @@ pub fn match_operator(op: &Operator, target: &String, value: &String, values: &L
         match values.get(i) {
           Some(v) => {
             if target == v {
-              return true;
+              return Ok(true);
             }
           }
           None => {}
         }
         i = i + 1;
       }
-      return false;
+      return Ok(false);
     }
   }
 }
@@ -818,12 +825,13 @@ pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestIn
   let mut best_rule_id = None;
   let mut best_reason = None;
   let mut best_rank = 0;
+  let mut budget_exhausted = false;
 
   let rules = policy.rules();
   let count = rules.len();
   let mut idx = 0;
 
-  while idx < count {
+  while idx < count && !budget_exhausted {
     match rules.get(idx) {
       Some(rule) => {
         let mut route_matched = true;
@@ -844,28 +852,56 @@ pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestIn
               let op = rule.op();
               let val = rule.value();
               let vals = rule.values();
-              matched = match_operator(&op, &m, &val, &vals);
+              match match_operator(&op, &m, &val, &vals) {
+                Ok(b) => {
+                  matched = b;
+                }
+                Err(_) => {
+                  budget_exhausted = true;
+                }
+              }
             }
             FieldTarget.TargetPath => {
               let p = input.path();
               let op = rule.op();
               let val = rule.value();
               let vals = rule.values();
-              matched = match_operator(&op, &p, &val, &vals);
+              match match_operator(&op, &p, &val, &vals) {
+                Ok(b) => {
+                  matched = b;
+                }
+                Err(_) => {
+                  budget_exhausted = true;
+                }
+              }
             }
             FieldTarget.TargetQuery => {
               let q = input.query();
               let op = rule.op();
               let val = rule.value();
               let vals = rule.values();
-              matched = match_operator(&op, &q, &val, &vals);
+              match match_operator(&op, &q, &val, &vals) {
+                Ok(b) => {
+                  matched = b;
+                }
+                Err(_) => {
+                  budget_exhausted = true;
+                }
+              }
             }
             FieldTarget.TargetBody => {
               match rule.op() {
                 Operator.Contains => {
                   let b = input.body();
                   let val = rule.value();
-                  matched = bytes_contains(&b, &val);
+                  match bytes_contains(&b, &val) {
+                    Ok(res_b) => {
+                      matched = res_b;
+                    }
+                    Err(_) => {
+                      budget_exhausted = true;
+                    }
+                  }
                 }
                 _ => {
                   let b = input.body();
@@ -874,7 +910,14 @@ pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestIn
                       let op = rule.op();
                       let val = rule.value();
                       let vals = rule.values();
-                      matched = match_operator(&op, &body_str, &val, &vals);
+                      match match_operator(&op, &body_str, &val, &vals) {
+                        Ok(res_b) => {
+                          matched = res_b;
+                        }
+                        Err(_) => {
+                          budget_exhausted = true;
+                        }
+                      }
                     }
                     Err(_) => {
                       matched = false;
@@ -888,7 +931,7 @@ pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestIn
               let h_count = headers.len();
               let mut h_idx = 0;
               let norm_target = to_ascii_lower(&target_header_name);
-              while h_idx < h_count && !matched {
+              while h_idx < h_count && !matched && !budget_exhausted {
                 match headers.get(h_idx) {
                   Some(h) => {
                     if to_ascii_lower(&h.name()) == norm_target {
@@ -896,8 +939,15 @@ pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestIn
                       let op = rule.op();
                       let rval = rule.value();
                       let rvals = rule.values();
-                      if match_operator(&op, &val, &rval, &rvals) {
-                        matched = true;
+                      match match_operator(&op, &val, &rval, &rvals) {
+                        Ok(res_b) => {
+                          if res_b {
+                            matched = true;
+                          }
+                        }
+                        Err(_) => {
+                          budget_exhausted = true;
+                        }
                       }
                     }
                   }
@@ -908,7 +958,15 @@ pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestIn
             }
           }
 
-          if matched {
+          if budget_exhausted {
+            // ADR 0068 決定 6: 検査資源上限の超過は fail-closed (Block) とする
+            // 決定 2: 資源上限には例外を作用させない
+            best_action = Action.Block;
+            best_rule_id = Some(rule.id());
+            let prefix = "resource limit exceeded: inspection budget exhausted on rule ";
+            let rid = rule.id();
+            best_reason = Some(str_concat(&prefix, &rid));
+          } else if matched {
             let mut act = rule.action();
             let mut reason_str = rule.description();
 
@@ -1240,14 +1298,25 @@ pub fn parse_policy(data: &Bytes) -> Result<Policy, Int>
 
     // value
     let mut value_str = "";
-    match json_get_field_index(&r_fields, &"value") {
-      Some(v_idx) => {
+    match op {
+      Operator.In => {
+        match json_get_field_index(&r_fields, &"value") {
+          Some(v_idx) => {
+            value_str = json_as_str(&nodes, v_idx)?;
+            if value_str.byte_len() > max_value_len() {
+              return Err(err_limit_exceeded());
+            }
+          }
+          None => {}
+        }
+      }
+      _ => {
+        let v_idx = require_field(&r_fields, &"value")?;
         value_str = json_as_str(&nodes, v_idx)?;
         if value_str.byte_len() > max_value_len() {
           return Err(err_limit_exceeded());
         }
       }
-      None => {}
     }
 
     // values
