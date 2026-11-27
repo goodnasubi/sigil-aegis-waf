@@ -1,0 +1,346 @@
+module aegis_observe
+  targets server
+  trust none
+
+use argus_observe.Level;
+use argus_observe.Line;
+use argus_observe.Metric;
+use argus_observe.MetricKind;
+use argus_observe.log_context;
+use argus_observe.log_line;
+use argus_observe.metric;
+
+pub struct Event {
+  outcome: String,
+  reason: String,
+  rule: String,
+  route: String,
+  version: String,
+  request: Bool,
+  detection: Bool,
+}
+
+pub struct Pending {
+  items: List<Event>,
+  requests: Int,
+  detections: Int,
+  dropped: Int,
+}
+
+pub struct Observer {
+  port: Int,
+  capacity: Int,
+  pending: Lock<Pending>,
+}
+
+pub fn observer(port: Int, capacity: Int) -> Observer
+  intent "Create a bounded queue owned by the gateway."
+  requires none
+  ensures none
+  effects none
+{
+  return Observer { port: port, capacity: capacity, pending: Lock.new(Pending { items: List.new(), requests: 0, detections: 0, dropped: 0 }) };
+}
+
+pub fn event(outcome: String, reason: String, rule: String, route: String, version: String, request: Bool, detection: Bool) -> Event
+  intent "Describe a decision using only policy metadata and fixed outcome codes."
+  requires none
+  ensures none
+  effects none
+{
+  return Event { outcome: outcome, reason: reason, rule: rule, route: route, version: version, request: request, detection: detection };
+}
+
+pub fn enqueue(output: &Observer, item: Event)
+  intent "Queue a decision or count its loss without making a network call."
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  if output.port == 0 {
+    return;
+  }
+  match output.pending.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let pending = held.get_mut();
+      if item.request {
+        pending.requests = pending.requests + 1;
+      }
+      if item.detection {
+        pending.detections = pending.detections + 1;
+      }
+      if item.outcome == "pass" {
+        return;
+      }
+      if pending.items.len() < output.capacity {
+        pending.items.push(item);
+      } else {
+        pending.dropped = pending.dropped + 1;
+      }
+    }
+    Err(_) => {}
+  }
+}
+
+fn take(output: &Observer) -> Pending
+  intent "Detach a batch and release the queue before encoding or network access."
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  match output.pending.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let pending = held.get_mut();
+      let batch = pending.clone();
+      pending.items = List.new();
+      pending.requests = 0;
+      pending.detections = 0;
+      pending.dropped = 0;
+      return batch;
+    }
+    Err(_) => {
+      return Pending { items: List.new(), requests: 0, detections: 0, dropped: 0 };
+    }
+  }
+}
+
+fn digits(out: &mut Bytes, n: Int, width: Int)
+  intent "Write a zero-padded calendar field."
+  requires none
+  ensures none
+  effects none
+{
+  let mut factor = 1;
+  let mut i = 1;
+  while i < width {
+    factor = factor * 10;
+    i = i + 1;
+  }
+  while factor > 0 {
+    out.push(48 + n / factor % 10);
+    factor = factor / 10;
+  }
+}
+
+fn timestamp(seconds: Int) -> String
+  intent "Convert Unix seconds to a Gregorian UTC timestamp."
+  requires none
+  ensures none
+  effects none
+{
+  let day_seconds = seconds % 86400;
+  let z = seconds / 86400 + 719468;
+  let era = z / 146097;
+  let day = z - era * 146097;
+  let year_in_era = (day - day / 1460 + day / 36524 - day / 146096) / 365;
+  let ordinal = day - (365 * year_in_era + year_in_era / 4 - year_in_era / 100);
+  let month_index = (5 * ordinal + 2) / 153;
+  let mut month = month_index - 9;
+  let mut year = year_in_era + era * 400;
+  if month_index < 10 {
+    month = month_index + 3;
+  }
+  if month <= 2 {
+    year = year + 1;
+  }
+  let mut out = Bytes.new();
+  digits(&mut out, year, 4);
+  out.push(45);
+  digits(&mut out, month, 2);
+  out.push(45);
+  digits(&mut out, ordinal - (153 * month_index + 2) / 5 + 1, 2);
+  out.push(84);
+  digits(&mut out, day_seconds / 3600, 2);
+  out.push(58);
+  digits(&mut out, day_seconds / 60 % 60, 2);
+  out.push(58);
+  digits(&mut out, day_seconds % 60, 2);
+  out.extend(&".000Z".as_bytes());
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn field(nodes: &mut List<JsonNode>, fields: &mut List<JsonField>, name: String, text: String)
+  intent "Add one string field to the log context."
+  requires none
+  ensures none
+  effects none
+{
+  fields.push(JsonField.new(name, nodes.len()));
+  nodes.push(JsonNode.Str(text));
+}
+
+fn encode(item: &Event, ts: &String) -> Option<Line>
+  intent "Encode policy metadata with the pinned Argus emitter."
+  requires none
+  ensures none
+  effects none
+{
+  let mut nodes = List.new();
+  let mut fields = List.new();
+  field(&mut nodes, &mut fields, "result", item.outcome.clone());
+  field(&mut nodes, &mut fields, "reason_code", item.reason.clone());
+  field(&mut nodes, &mut fields, "rule_id", item.rule.clone());
+  field(&mut nodes, &mut fields, "route_id", item.route.clone());
+  field(&mut nodes, &mut fields, "policy_version", item.version.clone());
+  let root = nodes.len();
+  nodes.push(JsonNode.Object(fields));
+  let context = log_context(None, None, None, None, Some(JsonValue.new(nodes, root)));
+  let mut level = Level.Info;
+  if item.outcome == "block" || item.outcome == "challenge" || item.outcome == "reject" {
+    level = Level.Warn;
+  }
+  return match log_line(&ts, &"sigil-aegis-waf", level, &"waf_decision", &context) {
+    Ok(line) => Some(line),
+    Err(_) => None,
+  };
+}
+
+fn send(port: Int, line: &Line) -> Bool
+  intent "Send a single NDJSON record to Argus and require its acknowledgement."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match net.connect(&"127.0.0.1", port) {
+    Ok(client) => {
+      let mut conn = client;
+      if conn.write_all(&line.ndjson()).is_err() {
+        return false;
+      }
+      let mut ack = Bytes.new();
+      while ack.byte_len() < 3 {
+        match conn.read(3 - ack.byte_len()) {
+          Ok(chunk) => {
+            if chunk.byte_len() == 0 {
+              return false;
+            }
+            ack.extend(&chunk);
+          }
+          Err(_) => {
+            return false;
+          }
+        }
+      }
+      return ack == "OK\n".as_bytes();
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+fn deliver(port: Int, line: &Line) -> Bool
+  intent "Bound every connection and acknowledgement wait independently of requests."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return task.timeout(200, || send(port, &line)).unwrap_or(false);
+}
+
+fn flush(port: Int, sample: &Metric, ts: &String) -> Bool
+  intent "Deliver the cumulative counter snapshot."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  match sample.snapshot(&ts) {
+    Ok(lines) => {
+      match lines.get(0) {
+        Some(line) => {
+          return deliver(port, &line);
+        }
+        None => {}
+      }
+    }
+    Err(_) => {}
+  }
+  return false;
+}
+
+fn counter(name: &String) -> Result<Metric, Int>
+  intent "Create a cumulative Argus counter with the normalized component label."
+  requires none
+  ensures none
+  effects none
+{
+  return metric(&"sigil-aegis-waf", &name, MetricKind.Counter, &List.new()).map_err(|error| 1);
+}
+
+fn worker(output: &Observer, mut_requests: Metric, mut_detections: Metric, mut_losses: Metric) -> Int
+  intent "Drain independently of requests and report cumulative losses after recovery."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  let mut requests = mut_requests;
+  let mut detections = mut_detections;
+  let mut losses = mut_losses;
+  let mut last = 0 - 1;
+  let mut dirty = false;
+  while true {
+    task.sleep(50);
+    match clock.unix_seconds() {
+      Some(seconds) => {
+        let ts = timestamp(seconds);
+        let batch = take(&output);
+        if batch.requests > 0 || batch.detections > 0 {
+          let _ = requests.record(to_float(batch.requests));
+          let _ = detections.record(to_float(batch.detections));
+          dirty = true;
+        }
+        let mut dropped = batch.dropped;
+        let mut healthy = true;
+        let mut i = 0;
+        while i < batch.items.len() {
+          match batch.items.get(i) {
+            Some(item) => {
+              if healthy {
+                match encode(&item, &ts) {
+                  Some(line) => {
+                    healthy = deliver(output.port, &line);
+                  }
+                  None => {
+                    healthy = false;
+                  }
+                }
+              }
+              if !healthy {
+                dropped = dropped + 1;
+              }
+            }
+            None => {}
+          }
+          i = i + 1;
+        }
+        if dropped > 0 {
+          let _ = losses.record(to_float(dropped));
+          dirty = true;
+        }
+        if dirty && healthy && seconds > last {
+          last = seconds;
+          let loss_ok = flush(output.port, &losses, &ts);
+          let requests_ok = loss_ok && flush(output.port, &requests, &ts);
+          let detections_ok = requests_ok && flush(output.port, &detections, &ts);
+          dirty = !detections_ok;
+        }
+      }
+      None => {}
+    }
+  }
+  return 0;
+}
+
+pub fn run(output: &Observer) -> Result<Int, Int>
+  intent "Run the independent Argus sender if a destination is configured."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  if output.port == 0 {
+    return Ok(0);
+  }
+  return Ok(worker(&output, counter(&"waf_requests_total")?, counter(&"waf_detections_total")?, counter(&"waf_telemetry_dropped_total")?));
+}

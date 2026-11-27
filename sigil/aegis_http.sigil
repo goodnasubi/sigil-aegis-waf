@@ -2,15 +2,24 @@ module aegis_http
   targets server
   trust none
 
+use aegis_ip.IpEffect;
+use aegis_ip.IpTable;
+use aegis_ip.evaluate_ip;
+use aegis_ip.ip_version;
+use aegis_observe.Event;
+use aegis_observe.event;
 use aegis_policy.Action;
 use aegis_policy.Header;
+use aegis_policy.Policy;
 use aegis_policy.RequestInput;
-use aegis_policy.default_managed_policy;
 use aegis_policy.evaluate;
 use aegis_policy.to_ascii_lower;
 use aegis_proxy.ProxyMetadata;
 use aegis_proxy.authority;
 use aegis_proxy.host_name;
+use aegis_proxy.source;
+use aegis_routes.Route;
+use aegis_routes.route_id;
 
 fn hop_header(name: &String) -> Bool
   intent "転送しない接続・フレーミング・転送元の見出しを識別する"
@@ -39,11 +48,11 @@ fn decimal(n: Int) -> Bytes
   return digits;
 }
 
-pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int) -> Result<Bytes, Int>
+pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table: &IpTable, policy: &Policy, routes: &List<Route>, observations: &mut List<Event>) -> Result<Bytes, Int>
   intent "検査を終えた要求だけを一意のフレーミングで組み立てる"
   requires none
   ensures none
-  effects clock, console, task.suspend
+  effects clock, task.suspend
 {
   if req.version() != 11 {
     return Err(505);
@@ -110,6 +119,17 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int) -> Resul
     }
     i = i + 1;
   }
+  let route = route_id(&routes, &path_text.clone().unwrap_or(""));
+  match evaluate_ip(&ip_table, &source(&meta), now) {
+    IpEffect.Block(reason) => {
+      observations.push(event("block", reason, "", route.clone(), ip_version(&ip_table), false, true));
+      return Err(403);
+    }
+    IpEffect.Record(reason) => {
+      observations.push(event("detect", reason, "", route.clone(), ip_version(&ip_table), false, true));
+    }
+    IpEffect.NoMatch => {}
+  }
   let body = req.body();
   if body.byte_len() != 0 || req.header(&"content-length").is_some() || req.header(&"transfer-encoding").is_some() {
     wire_headers.extend(&"content-length: ".as_bytes());
@@ -124,20 +144,21 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int) -> Resul
   }
 
   let method = req.method();
-  let input = RequestInput.new(method.clone(), path_text.unwrap_or(""), query_text.unwrap_or(""), input_headers, body.clone(), "default");
+  let input = RequestInput.new(method.clone(), path_text.unwrap_or(""), query_text.unwrap_or(""), input_headers, body.clone(), route.clone());
   // 期限をスケジューラーが処理できるよう、正規化と評価の間で中断する。
   task.sleep(0);
-  let decision = evaluate(&default_managed_policy(), &List.new(), &input, now);
+  let decision = evaluate(&policy, &List.new(), &input, now);
   match decision.action() {
     Action.Block => {
+      observations.push(event("block", "policy_block", decision.matched_rule_id().unwrap_or(""), route.clone(), decision.policy_version(), false, true));
       return Err(403);
     }
     Action.Challenge => {
-      console.log(&"challenge_required");
+      observations.push(event("challenge", "challenge_required", decision.matched_rule_id().unwrap_or(""), route.clone(), decision.policy_version(), false, true));
       return Err(403);
     }
     Action.LogOnly => {
-      console.log(&"log_only");
+      observations.push(event("detect", "log_only", decision.matched_rule_id().unwrap_or(""), route.clone(), decision.policy_version(), false, true));
     }
     Action.Pass => {}
   }

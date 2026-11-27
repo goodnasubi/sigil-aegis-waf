@@ -1,0 +1,150 @@
+module aegis_limit
+  targets server
+  trust none
+
+use aegis_ip.SourceIp;
+use aegis_ip.same_ip;
+
+pub struct Limits {
+  node_rate: Int,
+  node_burst: Int,
+  key_rate: Int,
+  key_burst: Int,
+  capacity: Int,
+}
+
+pub struct Bucket {
+  credit: Int,
+  at: Int,
+}
+
+pub struct Entry {
+  ip: SourceIp,
+  route: String,
+  bucket: Bucket,
+}
+
+pub struct Limiter {
+  limits: Limits,
+  node: Bucket,
+  keys: List<Entry>,
+}
+
+pub enum Admission {
+  Allow,
+  Limited(Int),
+  Unavailable,
+}
+
+pub fn limits(node_rate: Int, node_burst: Int, key_rate: Int, key_burst: Int, capacity: Int) -> Option<Limits>
+  intent "Validate finite node and per-key limits."
+  requires none
+  ensures none
+  effects none
+{
+  if node_rate < 1 || node_rate > 1000000 || node_burst < 1 || node_burst > 1000000 || key_rate < 1 || key_rate > 1000000 || key_burst < 1 || key_burst > 1000000 || capacity < 1 || capacity > 4096 {
+    return None;
+  }
+  return Some(Limits { node_rate: node_rate, node_burst: node_burst, key_rate: key_rate, key_burst: key_burst, capacity: capacity });
+}
+
+pub fn limiter(config: Limits) -> Limiter
+  intent "Start with a full node bucket and an empty key table."
+  requires none
+  ensures none
+  effects none
+{
+  let credit = config.node_burst * 1000000000;
+  return Limiter { limits: config, node: Bucket { credit: credit, at: 0 }, keys: List.new() };
+}
+
+fn refill(bucket: &Bucket, now: Int, rate: Int, full: Int) -> Int
+  intent "Refill in billionths of a token, capping elapsed time before multiplication."
+  requires none
+  ensures none
+  effects none
+{
+  if now <= bucket.at {
+    return bucket.credit;
+  }
+  let elapsed = now - bucket.at;
+  if elapsed >= (full - bucket.credit + rate - 1) / rate {
+    return full;
+  }
+  return bucket.credit + elapsed * rate;
+}
+
+pub fn admit_at(counters: &mut Limiter, ip: &SourceIp, route: &String, now: Int) -> Admission
+  intent "Decide and debit both buckets together while exclusively holding the node counters."
+  requires none
+  ensures none
+  effects none
+{
+  let unit = 1000000000;
+  let mut at = now;
+  if at < counters.node.at {
+    at = counters.node.at;
+  }
+  let full = counters.limits.key_burst * unit;
+  let mut key_credit = full;
+  let mut retained = List.new();
+  let mut i = 0;
+  while i < counters.keys.len() {
+    match counters.keys.get(i) {
+      Some(entry) => {
+        let credit = refill(&entry.bucket, at, counters.limits.key_rate, full);
+        if entry.route == route && same_ip(&entry.ip, &ip) {
+          key_credit = credit;
+        } else if credit < full {
+          retained.push(entry.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let node_credit = refill(&counters.node, at, counters.limits.node_rate, counters.limits.node_burst * unit);
+  counters.node = Bucket { credit: node_credit, at: at };
+  if retained.len() >= counters.limits.capacity {
+    return Admission.Unavailable;
+  }
+  let mut wait = 0;
+  if node_credit < unit {
+    wait = (unit - node_credit + counters.limits.node_rate - 1) / counters.limits.node_rate;
+  }
+  if key_credit < unit {
+    let key_wait = (unit - key_credit + counters.limits.key_rate - 1) / counters.limits.key_rate;
+    if key_wait > wait {
+      wait = key_wait;
+    }
+  }
+  if wait == 0 {
+    counters.node = Bucket { credit: node_credit - unit, at: at };
+    key_credit = key_credit - unit;
+  }
+  if key_credit < full {
+    retained.push(Entry { ip: ip.clone(), route: route.clone(), bucket: Bucket { credit: key_credit, at: at } });
+  }
+  counters.keys = retained;
+  if wait > 0 {
+    return Admission.Limited((wait + unit - 1) / unit);
+  }
+  return Admission.Allow;
+}
+
+pub fn admit(counters: &Lock<Limiter>, ip: &SourceIp, route: &String, now: Int) -> Admission
+  intent "Serialize concurrent requests using an injected monotonic timestamp."
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  match counters.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      return admit_at(held.get_mut(), &ip, &route, now);
+    }
+    Err(_) => {
+      return Admission.Unavailable;
+    }
+  }
+}
