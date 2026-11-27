@@ -1,0 +1,1488 @@
+module aegis_policy
+  targets server
+  trust none
+
+// ADR 0068 決定 2, 3, 7: ポリシーと検査の核（第1段）
+// - 型付きの検査入力（RequestInput）と検査結果（Decision）
+// - ポリシーとルールの宣言スキーマ（Policy, Rule, Exception）
+// - 版付きの基本ルール（マネージドセット）
+// - ルール ID と固定経路 ID を指定した、理由と失効日時付きの例外
+// - ポリシーの原子的な差し替え（AegisEngine）
+
+pub fn err_json_syntax() -> Int
+  intent "JSON 構文エラーコードを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 400;
+}
+
+pub fn err_unknown_field() -> Int
+  intent "未知項目エラーコードを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 401;
+}
+
+pub fn err_type_mismatch() -> Int
+  intent "型不一致エラーコードを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 402;
+}
+
+pub fn err_invalid_value() -> Int
+  intent "不正値エラーコードを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 403;
+}
+
+pub fn err_duplicate_id() -> Int
+  intent "重複 ID エラーコードを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 404;
+}
+
+pub fn err_limit_exceeded() -> Int
+  intent "上限超過エラーコードを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 405;
+}
+
+pub fn max_rules() -> Int
+  intent "最大ルール数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 1000;
+}
+
+pub fn max_exceptions() -> Int
+  intent "最大例外数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 500;
+}
+
+pub fn max_id_len() -> Int
+  intent "最大 ID 文字数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 64;
+}
+
+pub fn max_version_len() -> Int
+  intent "最大バージョン文字数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 64;
+}
+
+pub fn max_route_id_len() -> Int
+  intent "最大経路 ID 文字数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 64;
+}
+
+pub fn max_value_len() -> Int
+  intent "最大値文字数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 1024;
+}
+
+pub fn max_values_count() -> Int
+  intent "最大 values 要素数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 100;
+}
+
+pub fn max_desc_len() -> Int
+  intent "最大説明文文字数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 256;
+}
+
+pub fn max_reason_len() -> Int
+  intent "最大理由文字数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 256;
+}
+
+pub fn max_search_steps() -> Int
+  intent "最大検索ステップ数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 100000;
+}
+
+pub enum Action {
+  Block,
+  Challenge,
+  LogOnly,
+  Pass,
+}
+
+pub fn clone_action(action: &Action) -> Action
+  intent "Action を複製する"
+  requires none
+  ensures none
+  effects none
+{
+  return match action {
+    Action.Block => Action.Block,
+    Action.Challenge => Action.Challenge,
+    Action.LogOnly => Action.LogOnly,
+    Action.Pass => Action.Pass,
+  };
+}
+
+pub fn clone_operator(op: &Operator) -> Operator
+  intent "Operator を複製する"
+  requires none
+  ensures none
+  effects none
+{
+  return match op {
+    Operator.Exact => Operator.Exact,
+    Operator.Prefix => Operator.Prefix,
+    Operator.Contains => Operator.Contains,
+    Operator.In => Operator.In,
+  };
+}
+
+pub fn clone_target(target: &FieldTarget) -> FieldTarget
+  intent "FieldTarget を複製する"
+  requires none
+  ensures none
+  effects none
+{
+  return match target {
+    FieldTarget.TargetMethod => FieldTarget.TargetMethod,
+    FieldTarget.TargetPath => FieldTarget.TargetPath,
+    FieldTarget.TargetQuery => FieldTarget.TargetQuery,
+    FieldTarget.TargetHeader(hn) => FieldTarget.TargetHeader(hn.clone()),
+    FieldTarget.TargetBody => FieldTarget.TargetBody,
+  };
+}
+
+pub struct Header {
+  header_name: String,
+  header_val: String,
+}
+
+impl Header {
+  pub fn new(name: String, value: String) -> Header
+    intent "ヘッダーのキーと値を保持する"
+    requires none
+    ensures none
+    effects none
+  {
+    return Header { header_name: name, header_val: value };
+  }
+
+  pub fn name(self: &Header) -> String
+    intent "ヘッダー名を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.header_name.clone();
+  }
+
+  pub fn value(self: &Header) -> String
+    intent "ヘッダー値を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.header_val.clone();
+  }
+}
+
+pub struct RequestInput {
+  req_method: String,
+  req_path: String,
+  req_query: String,
+  req_headers: List<Header>,
+  req_body: Bytes,
+  req_route_id: String,
+}
+
+impl RequestInput {
+  pub fn new(method: String, path: String, query: String, headers: List<Header>, body: Bytes, route_id: String) -> RequestInput
+    intent "型付きの検査入力を構築する"
+    requires none
+    ensures none
+    effects none
+  {
+    return RequestInput { req_method: method, req_path: path, req_query: query, req_headers: headers, req_body: body, req_route_id: route_id };
+  }
+
+  pub fn method(self: &RequestInput) -> String
+    intent "HTTP メソッドを取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.req_method.clone();
+  }
+
+  pub fn path(self: &RequestInput) -> String
+    intent "パスを取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.req_path.clone();
+  }
+
+  pub fn query(self: &RequestInput) -> String
+    intent "クエリ文字列を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.req_query.clone();
+  }
+
+  pub fn headers(self: &RequestInput) -> List<Header>
+    intent "ヘッダー一覧を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.req_headers.clone();
+  }
+
+  pub fn body(self: &RequestInput) -> Bytes
+    intent "本文を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.req_body.clone();
+  }
+
+  pub fn route_id(self: &RequestInput) -> String
+    intent "固定経路 ID を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.req_route_id.clone();
+  }
+}
+
+pub struct Decision {
+  dec_action: Action,
+  dec_rule_id: Option<String>,
+  dec_reason: Option<String>,
+  dec_version: String,
+}
+
+impl Decision {
+  pub fn new(action: Action, matched_rule_id: Option<String>, reason: Option<String>, policy_version: String) -> Decision
+    intent "検査結果を構築する"
+    requires none
+    ensures none
+    effects none
+  {
+    return Decision { dec_action: action, dec_rule_id: matched_rule_id, dec_reason: reason, dec_version: policy_version };
+  }
+
+  pub fn action(self: &Decision) -> Action
+    intent "判定結果の作用を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return clone_action(&self.dec_action);
+  }
+
+  pub fn matched_rule_id(self: &Decision) -> Option<String>
+    intent "一致したルール ID を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.dec_rule_id.clone();
+  }
+
+  pub fn reason(self: &Decision) -> Option<String>
+    intent "判定理由を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.dec_reason.clone();
+  }
+
+  pub fn policy_version(self: &Decision) -> String
+    intent "評価に使用されたポリシー版を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.dec_version.clone();
+  }
+}
+
+pub enum FieldTarget {
+  TargetMethod,
+  TargetPath,
+  TargetQuery,
+  TargetHeader(String),
+  TargetBody,
+}
+
+pub enum Operator {
+  Exact,
+  Prefix,
+  Contains,
+  In,
+}
+
+pub struct Rule {
+  r_id: String,
+  r_route_id: Option<String>,
+  r_target: FieldTarget,
+  r_op: Operator,
+  r_value: String,
+  r_values: List<String>,
+  r_action: Action,
+  r_description: String,
+}
+
+impl Rule {
+  pub fn new(id: String, route_id: Option<String>, target: FieldTarget, op: Operator, value: String, values: List<String>, action: Action, description: String) -> Rule
+    intent "ルールを構築する"
+    requires none
+    ensures none
+    effects none
+  {
+    return Rule { r_id: id, r_route_id: route_id, r_target: target, r_op: op, r_value: value, r_values: values, r_action: action, r_description: description };
+  }
+
+  pub fn id(self: &Rule) -> String
+    intent "ルール ID を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.r_id.clone();
+  }
+
+  pub fn route_id(self: &Rule) -> Option<String>
+    intent "対象経路 ID を取得する（None なら全経路）"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.r_route_id.clone();
+  }
+
+  pub fn target(self: &Rule) -> FieldTarget
+    intent "検査対象フィールドを取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return clone_target(&self.r_target);
+  }
+
+  pub fn op(self: &Rule) -> Operator
+    intent "演算子を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return clone_operator(&self.r_op);
+  }
+
+  pub fn value(self: &Rule) -> String
+    intent "演算子の値を参照する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.r_value.clone();
+  }
+
+  pub fn values(self: &Rule) -> List<String>
+    intent "集合演算用の値一覧を参照する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.r_values.clone();
+  }
+
+  pub fn action(self: &Rule) -> Action
+    intent "ルールの作用を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return clone_action(&self.r_action);
+  }
+
+  pub fn description(self: &Rule) -> String
+    intent "ルールの説明文を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.r_description.clone();
+  }
+}
+
+pub struct Exception {
+  ex_rule_id: String,
+  ex_route_id: String,
+  ex_reason: String,
+  ex_expires_at: Int,
+}
+
+impl Exception {
+  pub fn new(rule_id: String, route_id: String, reason: String, expires_at: Int) -> Exception
+    intent "例外を構築する"
+    requires none
+    ensures none
+    effects none
+  {
+    return Exception { ex_rule_id: rule_id, ex_route_id: route_id, ex_reason: reason, ex_expires_at: expires_at };
+  }
+
+  pub fn rule_id(self: &Exception) -> String
+    intent "対象ルール ID を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.ex_rule_id.clone();
+  }
+
+  pub fn route_id(self: &Exception) -> String
+    intent "固定経路 ID を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.ex_route_id.clone();
+  }
+
+  pub fn reason(self: &Exception) -> String
+    intent "例外の理由を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.ex_reason.clone();
+  }
+
+  pub fn expires_at(self: &Exception) -> Int
+    intent "失効日時を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.ex_expires_at;
+  }
+
+  pub fn is_expired(self: &Exception, now: Int) -> Bool
+    intent "指定時刻において例外が失効しているか調べる"
+    requires none
+    ensures none
+    effects none
+  {
+    return now >= self.ex_expires_at;
+  }
+}
+
+pub struct Policy {
+  pol_version: String,
+  pol_rules: List<Rule>,
+}
+
+impl Policy {
+  pub fn new(version: String, rules: List<Rule>) -> Policy
+    intent "ポリシーを構築する"
+    requires none
+    ensures none
+    effects none
+  {
+    return Policy { pol_version: version, pol_rules: rules };
+  }
+
+  pub fn version(self: &Policy) -> String
+    intent "ポリシー版を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.pol_version.clone();
+  }
+
+  pub fn rules(self: &Policy) -> List<Rule>
+    intent "ルール一覧を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.pol_rules.clone();
+  }
+}
+
+pub struct AegisEngine {
+  eng_policy: Policy,
+  eng_exceptions: List<Exception>,
+}
+
+impl AegisEngine {
+  pub fn new(policy: Policy, exceptions: List<Exception>) -> AegisEngine
+    intent "WAF ポリシー評価エンジンを構築する"
+    requires none
+    ensures none
+    effects none
+  {
+    return AegisEngine { eng_policy: policy, eng_exceptions: exceptions };
+  }
+
+  pub fn policy(self: &AegisEngine) -> Policy
+    intent "現在の有効ポリシーを取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.eng_policy.clone();
+  }
+
+  pub fn exceptions(self: &AegisEngine) -> List<Exception>
+    intent "現在の例外一覧を取得する"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.eng_exceptions.clone();
+  }
+
+  pub fn inspect(self: &AegisEngine, input: &RequestInput, now: Int) -> Decision
+    intent "要求を検査し判定結果を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return evaluate(&self.eng_policy, &self.eng_exceptions, &input, now);
+  }
+
+  pub fn reload_policy(self: &mut AegisEngine, json_bytes: &Bytes) -> Result<Bool, Int>
+    intent "ポリシーを原子的に差し替える。失敗時は直前の版を保持する"
+    requires none
+    ensures none
+    effects none
+  {
+    let new_policy = parse_policy(&json_bytes)?;
+    self.eng_policy = new_policy;
+    return Ok(true);
+  }
+
+  pub fn reload_exceptions(self: &mut AegisEngine, json_bytes: &Bytes) -> Result<Bool, Int>
+    intent "例外設定を原子的に差し替える。失敗時は直前の設定を保持する"
+    requires none
+    ensures none
+    effects none
+  {
+    let new_exceptions = parse_exceptions(&json_bytes)?;
+    self.eng_exceptions = new_exceptions;
+    return Ok(true);
+  }
+
+  pub fn set_exceptions(self: &mut AegisEngine, exceptions: List<Exception>)
+    intent "例外一覧を直接設定する"
+    requires none
+    ensures none
+    effects none
+  {
+    self.eng_exceptions = exceptions;
+  }
+}
+
+pub fn action_rank(action: &Action) -> Int
+  intent "作用の強さを数値化する（Block 3 > Challenge 2 > LogOnly 1 > Pass 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match action {
+    Action.Block => 3,
+    Action.Challenge => 2,
+    Action.LogOnly => 1,
+    Action.Pass => 0,
+  };
+}
+
+pub fn str_concat(a: &String, b: &String) -> String
+  intent "二つの文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.new();
+  let a_b = a.as_bytes();
+  let b_b = b.as_bytes();
+  let mut i = 0;
+  while i < a_b.byte_len() {
+    bytes.push(a_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < b_b.byte_len() {
+    bytes.push(b_b.get(j).unwrap_or(0));
+    j = j + 1;
+  }
+  return bytes.to_string_utf8().unwrap_or(a.clone());
+}
+
+pub fn str_starts_with(s: &String, prefix: &String) -> Bool
+  intent "文字列が指定された接頭辞で始まるか調べる"
+  requires none
+  ensures none
+  effects none
+{
+  let s_bytes = s.as_bytes();
+  let p_bytes = prefix.as_bytes();
+  let p_len = p_bytes.byte_len();
+  if s_bytes.byte_len() < p_len {
+    return false;
+  }
+  let mut i = 0;
+  while i < p_len {
+    if s_bytes.get(i).unwrap_or(0) != p_bytes.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn bytes_contains(haystack: &Bytes, needle: &String) -> Result<Bool, Int>
+  intent "バイト列に needle の UTF-8 バイト列が含まれるか調べる（上限 100,000 比較、予算超過時はエラー）"
+  requires none
+  ensures none
+  effects none
+{
+  let n_bytes = needle.as_bytes();
+  let n_len = n_bytes.byte_len();
+  let h_len = haystack.byte_len();
+  if n_len == 0 {
+    return Ok(true);
+  }
+  if h_len < n_len {
+    return Ok(false);
+  }
+  let max_start = h_len - n_len;
+  let mut start = 0;
+  let mut steps = 0;
+  let mut found = false;
+  let limit = max_search_steps();
+  while start <= max_start && !found && steps <= limit {
+    let mut j = 0;
+    let mut matched = true;
+    while j < n_len && matched && steps <= limit {
+      steps = steps + 1;
+      if haystack.get(start + j).unwrap_or(0) != n_bytes.get(j).unwrap_or(0) {
+        matched = false;
+      } else {
+        j = j + 1;
+      }
+    }
+    if matched && j == n_len {
+      found = true;
+    } else {
+      start = start + 1;
+    }
+  }
+  if found {
+    return Ok(true);
+  }
+  if steps > limit {
+    return Err(err_limit_exceeded());
+  }
+  return Ok(false);
+}
+
+pub fn str_contains(haystack: &String, needle: &String) -> Result<Bool, Int>
+  intent "文字列に needle が含まれるか調べる（上限 100,000 比較、予算超過時はエラー）"
+  requires none
+  ensures none
+  effects none
+{
+  let h_bytes = haystack.as_bytes();
+  return bytes_contains(&h_bytes, &needle);
+}
+
+pub fn to_ascii_lower(s: &String) -> String
+  intent "ASCII 大文字を小文字に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c >= 65 && c <= 90 {
+      out.push(c + 32);
+    } else {
+      out.push(c);
+    }
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or(s.clone());
+}
+
+pub fn match_operator(op: &Operator, target: &String, value: &String, values: &List<String>) -> Result<Bool, Int>
+  intent "文字列対象に対する演算子を評価する"
+  requires none
+  ensures none
+  effects none
+{
+  match op {
+    Operator.Exact => {
+      return Ok(target == value);
+    }
+    Operator.Prefix => {
+      return Ok(str_starts_with(&target, &value));
+    }
+    Operator.Contains => {
+      return str_contains(&target, &value);
+    }
+    Operator.In => {
+      let mut i = 0;
+      let count = values.len();
+      while i < count {
+        match values.get(i) {
+          Some(v) => {
+            if target == v {
+              return Ok(true);
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      return Ok(false);
+    }
+  }
+}
+
+pub fn evaluate(policy: &Policy, exceptions: &List<Exception>, input: &RequestInput, now: Int) -> Decision
+  intent "ポリシーと例外に基づいて入力を評価し、最も強い作用の判定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut best_action = Action.Pass;
+  let mut best_rule_id = None;
+  let mut best_reason = None;
+  let mut best_rank = 0;
+  let mut budget_exhausted = false;
+
+  let rules = policy.rules();
+  let count = rules.len();
+  let mut idx = 0;
+
+  while idx < count && !budget_exhausted {
+    match rules.get(idx) {
+      Some(rule) => {
+        let mut route_matched = true;
+        match rule.route_id() {
+          Some(rid) => {
+            if rid != input.route_id() {
+              route_matched = false;
+            }
+          }
+          None => {}
+        }
+
+        if route_matched {
+          let mut matched = false;
+          match rule.target() {
+            FieldTarget.TargetMethod => {
+              let m = input.method();
+              let op = rule.op();
+              let val = rule.value();
+              let vals = rule.values();
+              match match_operator(&op, &m, &val, &vals) {
+                Ok(b) => {
+                  matched = b;
+                }
+                Err(_) => {
+                  budget_exhausted = true;
+                }
+              }
+            }
+            FieldTarget.TargetPath => {
+              let p = input.path();
+              let op = rule.op();
+              let val = rule.value();
+              let vals = rule.values();
+              match match_operator(&op, &p, &val, &vals) {
+                Ok(b) => {
+                  matched = b;
+                }
+                Err(_) => {
+                  budget_exhausted = true;
+                }
+              }
+            }
+            FieldTarget.TargetQuery => {
+              let q = input.query();
+              let op = rule.op();
+              let val = rule.value();
+              let vals = rule.values();
+              match match_operator(&op, &q, &val, &vals) {
+                Ok(b) => {
+                  matched = b;
+                }
+                Err(_) => {
+                  budget_exhausted = true;
+                }
+              }
+            }
+            FieldTarget.TargetBody => {
+              match rule.op() {
+                Operator.Contains => {
+                  let b = input.body();
+                  let val = rule.value();
+                  match bytes_contains(&b, &val) {
+                    Ok(res_b) => {
+                      matched = res_b;
+                    }
+                    Err(_) => {
+                      budget_exhausted = true;
+                    }
+                  }
+                }
+                _ => {
+                  let b = input.body();
+                  match b.to_string_utf8() {
+                    Ok(body_str) => {
+                      let op = rule.op();
+                      let val = rule.value();
+                      let vals = rule.values();
+                      match match_operator(&op, &body_str, &val, &vals) {
+                        Ok(res_b) => {
+                          matched = res_b;
+                        }
+                        Err(_) => {
+                          budget_exhausted = true;
+                        }
+                      }
+                    }
+                    Err(_) => {
+                      matched = false;
+                    }
+                  }
+                }
+              }
+            }
+            FieldTarget.TargetHeader(target_header_name) => {
+              let headers = input.headers();
+              let h_count = headers.len();
+              let mut h_idx = 0;
+              let norm_target = to_ascii_lower(&target_header_name);
+              while h_idx < h_count && !matched && !budget_exhausted {
+                match headers.get(h_idx) {
+                  Some(h) => {
+                    if to_ascii_lower(&h.name()) == norm_target {
+                      let val = h.value();
+                      let op = rule.op();
+                      let rval = rule.value();
+                      let rvals = rule.values();
+                      match match_operator(&op, &val, &rval, &rvals) {
+                        Ok(res_b) => {
+                          if res_b {
+                            matched = true;
+                          }
+                        }
+                        Err(_) => {
+                          budget_exhausted = true;
+                        }
+                      }
+                    }
+                  }
+                  None => {}
+                }
+                h_idx = h_idx + 1;
+              }
+            }
+          }
+
+          if budget_exhausted {
+            // ADR 0068 決定 6: 検査資源上限の超過は fail-closed (Block) とする
+            // 決定 2: 資源上限には例外を作用させない
+            best_action = Action.Block;
+            best_rule_id = Some(rule.id());
+            let prefix = "resource limit exceeded: inspection budget exhausted on rule ";
+            let rid = rule.id();
+            best_reason = Some(str_concat(&prefix, &rid));
+          } else if matched {
+            let mut act = rule.action();
+            let mut reason_str = rule.description();
+
+            match act {
+              Action.Block => {
+                let mut ex_idx = 0;
+                let ex_count = exceptions.len();
+                let mut exempted = false;
+                while ex_idx < ex_count && !exempted {
+                  match exceptions.get(ex_idx) {
+                    Some(ex) => {
+                      if !ex.is_expired(now) && ex.rule_id() == rule.id() && ex.route_id() == input.route_id() {
+                        act = Action.LogOnly;
+                        let prefix = "exception applied: ";
+                        let ex_r = ex.reason();
+                        reason_str = str_concat(&prefix, &ex_r);
+                        exempted = true;
+                      }
+                    }
+                    None => {}
+                  }
+                  ex_idx = ex_idx + 1;
+                }
+              }
+              _ => {}
+            }
+
+            let rank = action_rank(&act);
+            if rank > best_rank {
+              best_rank = rank;
+              best_action = act;
+              best_rule_id = Some(rule.id());
+              best_reason = Some(reason_str);
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    idx = idx + 1;
+  }
+
+  return Decision.new(best_action, best_rule_id, best_reason, policy.version());
+}
+
+fn json_get_field_index(fields: &List<JsonField>, key: &String) -> Option<Int>
+  intent "フィールド一覧からキーに一致する子のインデックスを探す"
+  requires none
+  ensures none
+  effects none
+{
+  let count = fields.len();
+  let mut i = 0;
+  while i < count {
+    match fields.get(i) {
+      Some(f) => {
+        if f.name() == key {
+          return Some(f.index());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn json_check_unknown_fields(fields: &List<JsonField>, allowed: &List<String>) -> Bool
+  intent "許可されたキー以外の未知項目が存在しないか調べる"
+  requires none
+  ensures none
+  effects none
+{
+  let count = fields.len();
+  let mut i = 0;
+  while i < count {
+    match fields.get(i) {
+      Some(f) => {
+        let name = f.name();
+        let mut allowed_found = false;
+        let mut j = 0;
+        let a_count = allowed.len();
+        while j < a_count && !allowed_found {
+          match allowed.get(j) {
+            Some(a) => {
+              if name == a {
+                allowed_found = true;
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+        if !allowed_found {
+          return false;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn json_as_str(nodes: &List<JsonNode>, idx: Int) -> Result<String, Int>
+  intent "指定インデックスのノードを文字列として取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(idx) {
+    Some(n) => match n {
+      JsonNode.Str(s) => Ok(s.clone()),
+      _ => Err(err_type_mismatch()),
+    },
+    None => Err(err_json_syntax()),
+  };
+}
+
+fn json_as_int(nodes: &List<JsonNode>, idx: Int) -> Result<Int, Int>
+  intent "指定インデックスのノードを整数として取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(idx) {
+    Some(n) => match n {
+      JsonNode.Int(val) => Ok(val),
+      _ => Err(err_type_mismatch()),
+    },
+    None => Err(err_json_syntax()),
+  };
+}
+
+fn json_as_object(nodes: &List<JsonNode>, idx: Int) -> Result<List<JsonField>, Int>
+  intent "指定インデックスのノードをオブジェクトのフィールド一覧として取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(idx) {
+    Some(n) => match n {
+      JsonNode.Object(fields) => Ok(fields.clone()),
+      _ => Err(err_type_mismatch()),
+    },
+    None => Err(err_json_syntax()),
+  };
+}
+
+fn json_as_array(nodes: &List<JsonNode>, idx: Int) -> Result<List<Int>, Int>
+  intent "指定インデックスのノードを配列のインデックス一覧として取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(idx) {
+    Some(n) => match n {
+      JsonNode.Array(items) => Ok(items.clone()),
+      _ => Err(err_type_mismatch()),
+    },
+    None => Err(err_json_syntax()),
+  };
+}
+
+fn require_field(fields: &List<JsonField>, key: &String) -> Result<Int, Int>
+  intent "必須フィールドのインデックスを取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match json_get_field_index(&fields, &key) {
+    Some(idx) => Ok(idx),
+    None => Err(err_invalid_value()),
+  };
+}
+
+fn get_array_item(list: &List<Int>, idx: Int) -> Result<Int, Int>
+  intent "配列の要素インデックスを取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(idx) {
+    Some(item) => Ok(item),
+    None => Err(err_json_syntax()),
+  };
+}
+
+pub fn parse_policy(data: &Bytes) -> Result<Policy, Int>
+  intent "ポリシー JSON をパースし、版・未知項目・型・重複ID・件数・サイズを全体検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let parsed_res = json.parse(&data);
+  if parsed_res.is_err() {
+    return Err(err_json_syntax());
+  }
+  let parsed = parsed_res.unwrap_or(JsonValue.new(List.new(), 0));
+  let nodes = parsed.nodes();
+  let root_fields = json_as_object(&nodes, parsed.root())?;
+
+  let mut allowed_top = List.new();
+  allowed_top.push("version");
+  allowed_top.push("rules");
+  if !json_check_unknown_fields(&root_fields, &allowed_top) {
+    return Err(err_unknown_field());
+  }
+
+  let ver_idx = require_field(&root_fields, &"version")?;
+  let version = json_as_str(&nodes, ver_idx)?;
+  if version.byte_len() == 0 || version.byte_len() > max_version_len() {
+    return Err(err_limit_exceeded());
+  }
+
+  let rules_idx = require_field(&root_fields, &"rules")?;
+  let rule_indices = json_as_array(&nodes, rules_idx)?;
+  let rule_count = rule_indices.len();
+  if rule_count > max_rules() {
+    return Err(err_limit_exceeded());
+  }
+
+  let mut allowed_rule = List.new();
+  allowed_rule.push("id");
+  allowed_rule.push("route_id");
+  allowed_rule.push("field");
+  allowed_rule.push("header_name");
+  allowed_rule.push("op");
+  allowed_rule.push("value");
+  allowed_rule.push("values");
+  allowed_rule.push("action");
+  allowed_rule.push("description");
+
+  let mut parsed_rules = List.new();
+  let mut existing_ids = List.new();
+
+  let mut r_idx = 0;
+  while r_idx < rule_count {
+    let item_idx = get_array_item(&rule_indices, r_idx)?;
+    let r_fields = json_as_object(&nodes, item_idx)?;
+    if !json_check_unknown_fields(&r_fields, &allowed_rule) {
+      return Err(err_unknown_field());
+    }
+
+    // id
+    let id_f = require_field(&r_fields, &"id")?;
+    let id = json_as_str(&nodes, id_f)?;
+    if id.byte_len() == 0 || id.byte_len() > max_id_len() {
+      return Err(err_limit_exceeded());
+    }
+
+    // 重複 ID の検証
+    let mut check_i = 0;
+    let existing_count = existing_ids.len();
+    while check_i < existing_count {
+      match existing_ids.get(check_i) {
+        Some(eid) => {
+          if eid == id {
+            return Err(err_duplicate_id());
+          }
+        }
+        None => {}
+      }
+      check_i = check_i + 1;
+    }
+    existing_ids.push(id.clone());
+
+    // route_id (任意)
+    let mut route_id_opt = None;
+    match json_get_field_index(&r_fields, &"route_id") {
+      Some(rid_idx) => {
+        let rid_str = json_as_str(&nodes, rid_idx)?;
+        if rid_str.byte_len() > max_route_id_len() {
+          return Err(err_limit_exceeded());
+        }
+        if rid_str.byte_len() > 0 {
+          route_id_opt = Some(rid_str);
+        }
+      }
+      None => {}
+    }
+
+    // field
+    let field_f = require_field(&r_fields, &"field")?;
+    let field_str = json_as_str(&nodes, field_f)?;
+
+    // header_name (field == "header" の場合)
+    let mut header_name_str = "";
+    match json_get_field_index(&r_fields, &"header_name") {
+      Some(hn_idx) => {
+        header_name_str = json_as_str(&nodes, hn_idx)?;
+      }
+      None => {}
+    }
+
+    let mut target = FieldTarget.TargetMethod;
+    if field_str == "method" {
+      target = FieldTarget.TargetMethod;
+    } else if field_str == "path" {
+      target = FieldTarget.TargetPath;
+    } else if field_str == "query" {
+      target = FieldTarget.TargetQuery;
+    } else if field_str == "header" {
+      if header_name_str.byte_len() == 0 || header_name_str.byte_len() > max_id_len() {
+        return Err(err_invalid_value());
+      }
+      target = FieldTarget.TargetHeader(to_ascii_lower(&header_name_str));
+    } else if field_str == "body" {
+      target = FieldTarget.TargetBody;
+    } else {
+      return Err(err_invalid_value());
+    }
+
+    // op
+    let op_f = require_field(&r_fields, &"op")?;
+    let op_str = json_as_str(&nodes, op_f)?;
+    let mut op = Operator.Exact;
+    if op_str == "exact" {
+      op = Operator.Exact;
+    } else if op_str == "prefix" {
+      op = Operator.Prefix;
+    } else if op_str == "contains" {
+      op = Operator.Contains;
+    } else if op_str == "in" {
+      op = Operator.In;
+    } else {
+      return Err(err_invalid_value());
+    }
+
+    // value
+    let mut value_str = "";
+    match op {
+      Operator.In => {
+        match json_get_field_index(&r_fields, &"value") {
+          Some(v_idx) => {
+            value_str = json_as_str(&nodes, v_idx)?;
+            if value_str.byte_len() > max_value_len() {
+              return Err(err_limit_exceeded());
+            }
+          }
+          None => {}
+        }
+      }
+      _ => {
+        let v_idx = require_field(&r_fields, &"value")?;
+        value_str = json_as_str(&nodes, v_idx)?;
+        if value_str.byte_len() > max_value_len() {
+          return Err(err_limit_exceeded());
+        }
+      }
+    }
+
+    // values
+    let mut values_list = List.new();
+    match json_get_field_index(&r_fields, &"values") {
+      Some(vs_idx) => {
+        let vs_items = json_as_array(&nodes, vs_idx)?;
+        if vs_items.len() > max_values_count() {
+          return Err(err_limit_exceeded());
+        }
+        let mut vi = 0;
+        let vlen = vs_items.len();
+        while vi < vlen {
+          let item = get_array_item(&vs_items, vi)?;
+          let s = json_as_str(&nodes, item)?;
+          if s.byte_len() > max_value_len() {
+            return Err(err_limit_exceeded());
+          }
+          values_list.push(s);
+          vi = vi + 1;
+        }
+      }
+      None => {}
+    }
+
+    match op {
+      Operator.In => {
+        if values_list.len() == 0 {
+          return Err(err_invalid_value());
+        }
+      }
+      _ => {}
+    }
+
+    // action
+    let act_f = require_field(&r_fields, &"action")?;
+    let act_str = json_as_str(&nodes, act_f)?;
+    let mut action = Action.Block;
+    if act_str == "block" {
+      action = Action.Block;
+    } else if act_str == "challenge" {
+      action = Action.Challenge;
+    } else if act_str == "log_only" {
+      action = Action.LogOnly;
+    } else {
+      return Err(err_invalid_value());
+    }
+
+    // description
+    let mut desc_str = "";
+    match json_get_field_index(&r_fields, &"description") {
+      Some(d_idx) => {
+        desc_str = json_as_str(&nodes, d_idx)?;
+        if desc_str.byte_len() > max_desc_len() {
+          return Err(err_limit_exceeded());
+        }
+      }
+      None => {}
+    }
+
+    let rule = Rule.new(id, route_id_opt, target, op, value_str, values_list, action, desc_str);
+    parsed_rules.push(rule);
+    r_idx = r_idx + 1;
+  }
+
+  return Ok(Policy.new(version, parsed_rules));
+}
+
+pub fn parse_exceptions(data: &Bytes) -> Result<List<Exception>, Int>
+  intent "例外一覧の JSON をパースし、未知項目・型・サイズを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let parsed_res = json.parse(&data);
+  if parsed_res.is_err() {
+    return Err(err_json_syntax());
+  }
+  let parsed = parsed_res.unwrap_or(JsonValue.new(List.new(), 0));
+  let nodes = parsed.nodes();
+  let root_items = json_as_array(&nodes, parsed.root())?;
+  let count = root_items.len();
+  if count > max_exceptions() {
+    return Err(err_limit_exceeded());
+  }
+
+  let mut allowed = List.new();
+  allowed.push("rule_id");
+  allowed.push("route_id");
+  allowed.push("reason");
+  allowed.push("expires_at");
+
+  let mut result_list = List.new();
+  let mut i = 0;
+  while i < count {
+    let item_idx = get_array_item(&root_items, i)?;
+    let fields = json_as_object(&nodes, item_idx)?;
+    if !json_check_unknown_fields(&fields, &allowed) {
+      return Err(err_unknown_field());
+    }
+
+    let r_idx = require_field(&fields, &"rule_id")?;
+    let rule_id = json_as_str(&nodes, r_idx)?;
+    if rule_id.byte_len() == 0 || rule_id.byte_len() > max_id_len() {
+      return Err(err_limit_exceeded());
+    }
+
+    let rt_idx = require_field(&fields, &"route_id")?;
+    let route_id = json_as_str(&nodes, rt_idx)?;
+    if route_id.byte_len() == 0 || route_id.byte_len() > max_route_id_len() {
+      return Err(err_limit_exceeded());
+    }
+
+    let re_idx = require_field(&fields, &"reason")?;
+    let reason = json_as_str(&nodes, re_idx)?;
+    if reason.byte_len() == 0 || reason.byte_len() > max_reason_len() {
+      return Err(err_limit_exceeded());
+    }
+
+    let ex_idx = require_field(&fields, &"expires_at")?;
+    let expires_at = json_as_int(&nodes, ex_idx)?;
+
+    result_list.push(Exception.new(rule_id, route_id, reason, expires_at));
+    i = i + 1;
+  }
+
+  return Ok(result_list);
+}
+
+pub fn default_managed_policy() -> Policy
+  intent "マネージドルール基本セット初版（2026-11-28-v1）を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rules = List.new();
+
+  // 1. TRACE メソッドの遮断
+  rules.push(Rule.new("mgr-block-trace", None, FieldTarget.TargetMethod, Operator.Exact, "TRACE", List.new(), Action.Block, "TRACE method blocked"));
+
+  // 2. TRACK メソッドの遮断
+  rules.push(Rule.new("mgr-block-track", None, FieldTarget.TargetMethod, Operator.Exact, "TRACK", List.new(), Action.Block, "TRACK method blocked"));
+
+  // 3. パストラバーサル (/../) の遮断
+  rules.push(Rule.new("mgr-block-traversal-slash", None, FieldTarget.TargetPath, Operator.Contains, "/../", List.new(), Action.Block, "Directory traversal attempt blocked"));
+
+  // 4. パストラバーサル (\..\) の遮断
+  rules.push(Rule.new("mgr-block-traversal-backslash", None, FieldTarget.TargetPath, Operator.Contains, "\\..\\", List.new(), Action.Block, "Directory traversal attempt blocked"));
+
+  // 5. SQL インジェクション (union select)
+  rules.push(Rule.new("mgr-block-sqli-union", None, FieldTarget.TargetQuery, Operator.Contains, "union select", List.new(), Action.Block, "SQL injection attempt blocked"));
+
+  // 6. SQL インジェクション (' or '1'='1)
+  rules.push(Rule.new("mgr-block-sqli-quote-or", None, FieldTarget.TargetQuery, Operator.Contains, "' or '", List.new(), Action.Block, "SQL injection attempt blocked"));
+
+  // 7. XSS (<script)
+  rules.push(Rule.new("mgr-block-xss-script", None, FieldTarget.TargetQuery, Operator.Contains, "<script", List.new(), Action.Block, "XSS attempt blocked"));
+
+  // 8. XSS (javascript:)
+  rules.push(Rule.new("mgr-block-xss-javascript", None, FieldTarget.TargetQuery, Operator.Contains, "javascript:", List.new(), Action.Block, "XSS attempt blocked"));
+
+  // 9. 管理エンドポイントのアクセス記録 (LogOnly)
+  rules.push(Rule.new("mgr-log-admin-access", None, FieldTarget.TargetPath, Operator.Prefix, "/admin", List.new(), Action.LogOnly, "Admin access logged"));
+
+  // 10. 機密エンドポイントの追加確認 (Challenge)
+  rules.push(Rule.new("mgr-challenge-auth", None, FieldTarget.TargetPath, Operator.Prefix, "/auth/verify", List.new(), Action.Challenge, "Authentication challenge required"));
+
+  return Policy.new("2026-11-28-v1", rules);
+}

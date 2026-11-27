@@ -1,0 +1,4 @@
+# Sigil manifest for sigil-aegis-waf
+[package]
+name = "sigil-aegis-waf"
+version = "0.1.0"
