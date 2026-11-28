@@ -2,13 +2,24 @@ module aegis_gateway
   targets server
   trust none
 
+use aegis_budget.Settings;
+use aegis_budget.begin;
+use aegis_budget.begin_at;
+use aegis_budget.elapsed;
+use aegis_budget.pinned_limits;
+use aegis_budget.policy_chunks;
+use aegis_budget.settings;
 use aegis_http.check_request;
 use aegis_ip.IpTable;
 use aegis_ip.ip_version;
 use aegis_ip.parse_ip_table;
+use aegis_limit.Limiter;
+use aegis_limit.limiter;
+use aegis_limit.limits;
 use aegis_observe.Observer;
 use aegis_observe.enqueue;
 use aegis_observe.event;
+use aegis_observe.observe_decision;
 use aegis_observe.observer;
 use aegis_observe.run;
 use aegis_policy.Policy;
@@ -23,6 +34,9 @@ use aegis_routes.routes;
 struct Config {
   ip_table: IpTable,
   policy: Policy,
+  chunks: List<Policy>,
+  counters: Lock<Limiter>,
+  budget: Settings,
   routes: List<Route>,
   telemetry: Observer,
 }
@@ -67,13 +81,13 @@ fn read_proxy(stream: &TcpStream) -> Result<ProxyMetadata, Int>
   return parse_proxy(&head, &payload);
 }
 
-fn read_request(stream: &TcpStream) -> Result<HttpRequest, Int>
+fn read_request(stream: &TcpStream, body_limit: Int) -> Result<HttpRequest, Int>
   intent "標準の増分パーサーで HTTP 要求を一件読む"
   requires none
   ensures none
   effects net.server, task.suspend
 {
-  let mut parser = http.parser(&http.default_limits());
+  let mut parser = http.parser(&pinned_limits(body_limit));
   let mut continued = false;
   while true {
     match stream.read(16384) {
@@ -105,8 +119,8 @@ fn read_request(stream: &TcpStream) -> Result<HttpRequest, Int>
   return Err(400);
 }
 
-fn send_error(stream: &TcpStream, status: Int)
-  intent "接続を閉じる定型 HTTP 応答を返す"
+fn send_error(stream: &TcpStream, status: Int, retry_after: Int)
+  intent "接続を閉じる定型 HTTP 応答を返す。Retry-After は算出できたときだけ付ける"
   requires none
   ensures none
   effects clock, net.server, task.spawn, task.suspend
@@ -118,6 +132,7 @@ fn send_error(stream: &TcpStream, status: Int)
     414 => "414 URI Too Long",
     417 => "417 Expectation Failed",
     421 => "421 Misdirected Request",
+    429 => "429 Too Many Requests",
     431 => "431 Request Header Fields Too Large",
     501 => "501 Not Implemented",
     502 => "502 Bad Gateway",
@@ -127,23 +142,45 @@ fn send_error(stream: &TcpStream, status: Int)
   };
   let mut reply = "HTTP/1.1 ".as_bytes();
   reply.extend(&reason.as_bytes());
+  if retry_after > 0 {
+    reply.extend(&"\r\nretry-after: ".as_bytes());
+    reply.extend(&seconds_text(retry_after));
+  }
   reply.extend(&"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".as_bytes());
   let _ = task.timeout(1000, || stream.write_all(&reply));
 }
 
-fn upstream(stream: &TcpStream, port: Int, meta: &ProxyMetadata, request: &Bytes)
+fn seconds_text(n: Int) -> Bytes
+  intent "Write a positive integer in decimal."
+  requires none
+  ensures none
+  effects none
+{
+  let mut digits = Bytes.new();
+  let mut factor = 1;
+  while n / factor >= 10 {
+    factor = factor * 10;
+  }
+  while factor > 0 {
+    digits.push(48 + n / factor % 10);
+    factor = factor / 10;
+  }
+  return digits;
+}
+
+fn upstream(stream: &TcpStream, port: Int, meta: &ProxyMetadata, request: &Bytes, budget: &Settings)
   intent "判定済みの要求と接続情報を専用の上流接続へ渡す"
   requires none
   ensures none
   effects clock, net, task.spawn, task.suspend
 {
-  match task.timeout(10000, || start_upstream(port, &meta, &request)) {
+  match task.timeout(budget.connect_ms, || start_upstream(port, &meta, &request)) {
     Some(Ok((client, first))) => {
       let mut origin = client;
-      let _ = task.timeout(30000, || relay_response(&stream, &mut origin, &first));
+      let _ = task.timeout(budget.relay_ms, || relay_response(&stream, &mut origin, &first));
     }
     _ => {
-      send_error(&stream, 502);
+      send_error(&stream, 502, 0);
     }
   }
 }
@@ -214,17 +251,20 @@ fn handle(stream: &TcpStream, upstream_port: Int, config: &Config)
   }
   match task.timeout(1000, || read_proxy(&stream)) {
     Some(Ok(meta)) => {
-      match task.timeout(30000, || read_request(&stream)) {
+      match task.timeout(config.budget.receive_ms, || read_request(&stream, config.budget.body_limit)) {
         Some(Ok(req)) => {
           enqueue(&config.telemetry, event("pass", "", "", "default", "", true, false));
           let wall = clock.unix_seconds();
-          if wall.is_none() {
-            send_error(&stream, 503);
+          let started = begin(config.budget.deadline_ns);
+          if wall.is_none() || started.is_none() {
+            send_error(&stream, 503, 0);
             return;
           }
           let now = wall.unwrap_or(0);
+          let mut watch = started.unwrap_or(begin_at(0, 0));
           let mut observations = List.new();
-          let decision = task.timeout(10, || check_request(&req, &meta, now, &config.ip_table, &config.policy, &config.routes, &mut observations));
+          let decision = check_request(&req, &meta, now, &config.ip_table, &config.chunks, &config.routes, &config.counters, &mut watch, &mut observations);
+          observe_decision(&config.telemetry, elapsed(&watch));
           let mut i = 0;
           while i < observations.len() {
             match observations.get(i) {
@@ -236,25 +276,21 @@ fn handle(stream: &TcpStream, upstream_port: Int, config: &Config)
             i = i + 1;
           }
           match decision {
-            Some(Ok(wire)) => {
-              upstream(&stream, upstream_port, &meta, &wire);
+            Ok(wire) => {
+              upstream(&stream, upstream_port, &meta, &wire, &config.budget);
             }
-            Some(Err(status)) => {
-              send_error(&stream, status);
-            }
-            None => {
-              enqueue(&config.telemetry, event("reject", "decision_timeout", "", "default", config.policy.version(), false, false));
-              send_error(&stream, 503);
+            Err(rejected) => {
+              send_error(&stream, rejected.status(), rejected.retry_after());
             }
           }
         }
         Some(Err(status)) => {
           enqueue(&config.telemetry, event("reject", "http_invalid", "", "default", "", true, false));
-          send_error(&stream, status);
+          send_error(&stream, status, 0);
         }
         None => {
           enqueue(&config.telemetry, event("reject", "request_timeout", "", "default", "", true, false));
-          send_error(&stream, 408);
+          send_error(&stream, 408, 0);
         }
       }
     }
@@ -280,19 +316,25 @@ pub fn main() -> Int
   if argus_port < 0 || argus_port > 65535 || queue < 1 || queue > 4096 {
     return 1;
   }
-  return match configure(&table.as_bytes(), &route_data.as_bytes(), argus_port, queue) {
-    Ok(validated) => serve(port, upstream_port, validated),
+  return match settings() {
+    Ok(budget) => match configure(&table.as_bytes(), &route_data.as_bytes(), argus_port, queue, budget) {
+      Ok(validated) => serve(port, upstream_port, validated),
+      Err(_) => 1,
+    },
     Err(_) => 1,
   };
 }
 
-fn configure(table: &Bytes, route_data: &Bytes, argus_port: Int, capacity: Int) -> Result<Config, Int>
-  intent "Validate the complete IP and route configuration before listening."
+fn configure(table: &Bytes, route_data: &Bytes, argus_port: Int, capacity: Int, budget: Settings) -> Result<Config, Int>
+  intent "Validate the complete limits, IP, route and rate configuration before listening."
   requires none
   ensures none
   effects none
 {
-  return Ok(Config { ip_table: parse_ip_table(&table)?, policy: default_managed_policy(), routes: routes(&route_data)?, telemetry: observer(argus_port, capacity) });
+  let policy = default_managed_policy();
+  let chunks = policy_chunks(&policy)?;
+  let rates = limits(budget.node_rate, budget.node_burst, budget.key_rate, budget.key_burst, budget.table_capacity).ok_or(1)?;
+  return Ok(Config { ip_table: parse_ip_table(&table)?, policy: policy, chunks: chunks, counters: Lock.new(limiter(rates)), budget: budget, routes: routes(&route_data)?, telemetry: observer(argus_port, capacity) });
 }
 
 fn serve(port: Int, upstream_port: Int, config: Config) -> Int
@@ -301,11 +343,16 @@ fn serve(port: Int, upstream_port: Int, config: Config) -> Int
   ensures none
   effects clock, console, net, task
 {
+  // 出力が有効なときは、送信処理も一つの枠を使う。
+  let mut cap = config.budget.max_connections;
+  if config.telemetry.port != 0 {
+    cap = cap + 1;
+  }
   let shared = SyncShared.new(config);
   match net.listen(&"127.0.0.1", port, 128) {
     Ok(listener) => {
       console.log(&listener.local_port());
-      return task.roots(65, |g| {
+      return task.roots(cap, |g| {
         let deployed = shared.borrow();
         let sender = g.reserve();
         sender.start(shared.clone(), move |worker| {

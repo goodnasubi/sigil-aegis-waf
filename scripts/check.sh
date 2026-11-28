@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sigil_sha=e1a0291ab419dca0a04c9d7315c3567b81308a1f
+sigil_sha=1a4bf74c09ff5e83d7bb7a5426e3e50095495568
 shield_sha=63d3051b18e6d0e90c1ebe8f76e6ce267d7534a4
 argus_sha=113aeed4932d841d752d752e77dc767ed6b4c886
 db_sha=9483e36f08c35bfc62b3beeb008a531887506037
@@ -64,6 +64,8 @@ run_entry() {
 
 run_entry stage1_policy_test "Stage 1 policy core"
 run_entry stage3_ip_limit_test "Stage 3 IP and rate-limit core"
+run_entry stage4_budget_test "Stage 4 budget, deadline and admission core"
+run_entry stage4_fuzz_test "Stage 4 fixed-seed short fuzz run"
 
 fetch_pinned https://github.com/goodnasubi/sigil-shield-tls.git "$shield_sha" "$scratch/shield"
 cp "$scratch/shield/sigil/shield_proxy_v2.sigil" "$repo_root/tests/shield_preface.sigil" "$root/"
@@ -72,6 +74,7 @@ cp "$scratch/shield/sigil/shield_proxy_v2.sigil" "$repo_root/tests/shield_prefac
 "$sigil" build --root "$root" "$root/aegis_gateway.sigil" main -o "$scratch/aegis"
 "$sigil" build --root "$root" "$root/shield_preface.sigil" main -o "$scratch/shield-preface"
 python3 "$repo_root/tests/stage2_loopback.py" "$scratch/aegis" "$scratch/shield-preface"
+python3 -B "$repo_root/tests/stage4_loopback.py" "$scratch/aegis" "$scratch/shield-preface"
 
 
 fetch_pinned https://github.com/goodnasubi/sigil-db.git "$db_sha" "$scratch/db"

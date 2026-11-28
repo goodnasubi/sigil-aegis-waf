@@ -1,0 +1,120 @@
+{
+  "cases": {
+    "body_1MiB": {
+      "decision": {
+        "count": 40,
+        "fraction_within": {
+          "le_0.1ms": 0.0,
+          "le_0.25ms": 0.0,
+          "le_0.5ms": 0.0,
+          "le_10ms": 1.0,
+          "le_1ms": 0.0,
+          "le_2ms": 0.0,
+          "le_5ms": 0.875
+        },
+        "mean_ms": 4.0566764,
+        "p95_upper_bound_ms": 10.0
+      },
+      "peak_rss_kib": 6120,
+      "request_bytes": 1048646,
+      "statuses": {
+        "200": 40
+      }
+    },
+    "body_64KiB": {
+      "decision": {
+        "count": 40,
+        "fraction_within": {
+          "le_0.1ms": 0.0,
+          "le_0.25ms": 0.0,
+          "le_0.5ms": 0.125,
+          "le_10ms": 1.0,
+          "le_1ms": 0.95,
+          "le_2ms": 1.0,
+          "le_5ms": 1.0
+        },
+        "mean_ms": 0.647631275,
+        "p95_upper_bound_ms": 1.0
+      },
+      "peak_rss_kib": 2404,
+      "request_bytes": 65604,
+      "statuses": {
+        "200": 40
+      }
+    },
+    "headers_100": {
+      "decision": {
+        "count": 40,
+        "fraction_within": {
+          "le_0.1ms": 0.0,
+          "le_0.25ms": 0.0,
+          "le_0.5ms": 0.0,
+          "le_10ms": 0.9,
+          "le_1ms": 0.0,
+          "le_2ms": 0.0,
+          "le_5ms": 0.9
+        },
+        "mean_ms": 4.175877900000001,
+        "p95_upper_bound_ms": null
+      },
+      "peak_rss_kib": 2132,
+      "request_bytes": 1684,
+      "statuses": {
+        "200": 36,
+        "503": 4
+      }
+    },
+    "headers_16KiB": {
+      "decision": {
+        "count": 40,
+        "fraction_within": {
+          "le_0.1ms": 0.0,
+          "le_0.25ms": 0.0,
+          "le_0.5ms": 0.0,
+          "le_10ms": 0.975,
+          "le_1ms": 0.0,
+          "le_2ms": 0.225,
+          "le_5ms": 0.975
+        },
+        "mean_ms": 2.4120275499999995,
+        "p95_upper_bound_ms": 5.0
+      },
+      "peak_rss_kib": 2140,
+      "request_bytes": 15568,
+      "statuses": {
+        "200": 40
+      }
+    },
+    "request_line_8KiB": {
+      "decision": {
+        "count": 40,
+        "fraction_within": {
+          "le_0.1ms": 0.0,
+          "le_0.25ms": 0.0,
+          "le_0.5ms": 0.0,
+          "le_10ms": 0.95,
+          "le_1ms": 0.0,
+          "le_2ms": 0.0,
+          "le_5ms": 0.65
+        },
+        "mean_ms": 6.033005200000002,
+        "p95_upper_bound_ms": 10.0
+      },
+      "peak_rss_kib": 2068,
+      "request_bytes": 8216,
+      "statuses": {
+        "200": 38,
+        "503": 2
+      }
+    }
+  },
+  "concurrency": 1,
+  "machine": {
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "kernel": "6.18.44-fc-v880",
+    "logical_cpus": 4,
+    "memory_gib": 15.7,
+    "python": "3.13.18"
+  },
+  "profile": "limits"
+}

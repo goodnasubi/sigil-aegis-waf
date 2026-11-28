@@ -718,30 +718,25 @@ pub fn bytes_contains(haystack: &Bytes, needle: &String) -> Result<Bool, Int>
   if h_len < n_len {
     return Ok(false);
   }
+  let first = n_bytes.get(0).unwrap_or(0);
   let max_start = h_len - n_len;
   let mut start = 0;
   let mut steps = 0;
-  let mut found = false;
   let limit = max_search_steps();
-  while start <= max_start && !found && steps <= limit {
-    let mut j = 0;
-    let mut matched = true;
-    while j < n_len && matched && steps <= limit {
-      steps = steps + 1;
-      if haystack.get(start + j).unwrap_or(0) != n_bytes.get(j).unwrap_or(0) {
-        matched = false;
-      } else {
+  while start <= max_start && steps <= limit {
+    // 候補位置ごとに先頭バイトだけを一度比較し、一致したときだけ残りを確かめる。
+    steps = steps + 1;
+    if haystack.get(start).unwrap_or(0) == first {
+      let mut j = 1;
+      while j < n_len && steps <= limit && haystack.get(start + j).unwrap_or(0) == n_bytes.get(j).unwrap_or(0) {
+        steps = steps + 1;
         j = j + 1;
       }
+      if j == n_len {
+        return Ok(true);
+      }
     }
-    if matched && j == n_len {
-      found = true;
-    } else {
-      start = start + 1;
-    }
-  }
-  if found {
-    return Ok(true);
+    start = start + 1;
   }
   if steps > limit {
     return Err(err_limit_exceeded());

@@ -1,0 +1,308 @@
+module stage4_fuzz_test
+  targets server
+  trust none
+
+use aegis_budget.begin_at;
+use aegis_budget.pinned_limits;
+use aegis_budget.policy_chunks;
+use aegis_http.check_request;
+use aegis_ip.IpTable;
+use aegis_ip.parse_ip_table;
+use aegis_limit.Limiter;
+use aegis_limit.limiter;
+use aegis_limit.limits;
+use aegis_policy.default_managed_policy;
+use aegis_policy.parse_policy;
+use aegis_proxy.ProxyMetadata;
+use aegis_proxy.parse_proxy;
+use aegis_routes.routes;
+
+// ADR 0020 決定 2 の短い実行。種を固定した小さな生成器で、検査の入力（設定の JSON・PROXY v2・HTTP 要求）を壊し、
+// どの入力でも Ok か Err（値）で返り、異常停止しないことと、転送する要求の骨組みが一意であることを確かめる。
+struct Gen {
+  state: Int,
+}
+
+impl Gen {
+  fn next(self: &mut Gen) -> Int
+    intent "Park-Miller minimal standard generator; the state never exceeds 31 bits so nothing overflows."
+    requires none
+    ensures none
+    effects none
+  {
+    self.state = self.state * 48271 % 2147483647;
+    return self.state;
+  }
+}
+
+fn mutate(seed: &Bytes, gen: &mut Gen) -> Bytes
+  intent "Apply a few byte flips, insertions, deletions, truncations and repeats to a seed input."
+  requires none
+  ensures none
+  effects none
+{
+  let mut current = seed.clone();
+  let rounds = gen.next() % 4 + 1;
+  let mut round = 0;
+  while round < rounds {
+    let size = current.byte_len();
+    let mut at = 0;
+    if size > 0 {
+      at = gen.next() % size;
+    }
+    let operation = gen.next() % 6;
+    let mut changed = Bytes.new();
+    if operation == 0 {
+      changed = current.slice(0, at).unwrap_or(Bytes.new());
+      changed.push(gen.next() % 256);
+      changed.extend(&current.slice(at + 1, size).unwrap_or(Bytes.new()));
+    } else if operation == 1 {
+      changed = current.slice(0, at).unwrap_or(Bytes.new());
+      changed.push(gen.next() % 256);
+      changed.extend(&current.slice(at, size).unwrap_or(Bytes.new()));
+    } else if operation == 2 {
+      changed = current.slice(0, at).unwrap_or(Bytes.new());
+      changed.extend(&current.slice(at + 1, size).unwrap_or(Bytes.new()));
+    } else if operation == 3 {
+      changed = current.slice(0, at).unwrap_or(Bytes.new());
+    } else if operation == 4 {
+      changed = current.slice(0, at).unwrap_or(Bytes.new());
+      changed.extend(&current.slice(at, size).unwrap_or(Bytes.new()));
+      changed.extend(&current.slice(at, size).unwrap_or(Bytes.new()));
+    } else {
+      let edge = gen.next() % 5;
+      changed = current.slice(0, at).unwrap_or(Bytes.new());
+      if edge == 0 {
+        changed.extend(&"\r\n".as_bytes());
+      } else if edge == 1 {
+        changed.push(13);
+      } else if edge == 2 {
+        changed.push(10);
+      } else if edge == 3 {
+        changed.push(0);
+      } else {
+        changed.push(255);
+      }
+      changed.extend(&current.slice(at, size).unwrap_or(Bytes.new()));
+    }
+    current = changed;
+    round = round + 1;
+  }
+  return current;
+}
+
+fn pick(seeds: &List<Bytes>, gen: &mut Gen) -> Bytes
+  intent "Choose one seed."
+  requires none
+  ensures none
+  effects none
+{
+  let index = gen.next() % seeds.len();
+  return match seeds.get(index) {
+    Some(seed) => seed.clone(),
+    None => Bytes.new(),
+  };
+}
+
+fn preface_for(last: Int) -> Bytes
+  intent "A valid PROXY v2 preface for TCP over IPv4 with the TLS 1.3 TLV."
+  requires none
+  ensures none
+  effects none
+{
+  let mut head = "\r\n\r\n\u{0}\r\nQUIT\n".as_bytes();
+  head.push(33);
+  head.push(17);
+  head.push(0);
+  head.push(30);
+  head.push(10);
+  head.push(0);
+  head.push(0);
+  head.push(last);
+  head.push(10);
+  head.push(0);
+  head.push(0);
+  head.push(1);
+  head.push(4);
+  head.push(210);
+  head.push(1);
+  head.push(187);
+  head.push(32);
+  head.push(0);
+  head.push(15);
+  head.extend(&"\u{1}\u{0}\u{0}\u{0}\u{0}!\u{0}\u{7}TLSv1.3".as_bytes());
+  return head;
+}
+
+fn read_proxy(input: &Bytes) -> Option<ProxyMetadata>
+  intent "Split a preface at the fixed header and validate it."
+  requires none
+  ensures none
+  effects none
+{
+  if input.byte_len() < 16 {
+    return None;
+  }
+  let head = input.slice(0, 16).unwrap_or(Bytes.new());
+  let payload = input.slice(16, input.byte_len()).unwrap_or(Bytes.new());
+  return match parse_proxy(&head, &payload) {
+    Ok(meta) => Some(meta),
+    Err(_) => None,
+  };
+}
+
+fn forwarded_is_unique(wire: &Bytes, expected_body: &Bytes) -> Bool
+  intent "A forwarded request re-parses to exactly one request with the same body and no client forwarding headers."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parser = http.parser(&pinned_limits(1048576));
+  match parser.feed(&wire, 0) {
+    Ok(HttpProgress.Done(req, _)) => {
+      if req.body() != expected_body || req.header(&"forwarded").is_some() || req.header(&"x-forwarded-for").is_some() || req.header(&"transfer-encoding").is_some() {
+        return false;
+      }
+      return req.version() == 11;
+    }
+    _ => {
+      return false;
+    }
+  }
+}
+
+fn exercise_http(input: &Bytes, meta: &ProxyMetadata, table: &IpTable, counters: &Lock<Limiter>) -> Int
+  intent "Run one input through the parser and the inspection path."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let mut parser = http.parser(&pinned_limits(1048576));
+  match parser.feed(&input, 0) {
+    Ok(HttpProgress.Done(req, _)) => {
+      let chunks = policy_chunks(&default_managed_policy()).unwrap_or(List.new());
+      let mut watch = begin_at(clock.monotonic_nanos().unwrap_or(0), 10000000000);
+      let mut seen = List.new();
+      let no_routes = routes(&"[]".as_bytes()).unwrap_or(List.new());
+      match check_request(&req, &meta, 0, &table, &chunks, &no_routes, &counters, &mut watch, &mut seen) {
+        Ok(wire) => {
+          if !forwarded_is_unique(&wire, &req.body()) {
+            return 1;
+          }
+        }
+        Err(_) => {}
+      }
+    }
+    _ => {}
+  }
+  return 0;
+}
+
+fn run_kind(kind: Int, seeds: &List<Bytes>, gen: &mut Gen, rounds: Int, meta: &ProxyMetadata, table: &IpTable, counters: &Lock<Limiter>) -> Int
+  intent "Run one target for a fixed number of inputs."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let mut i = 0;
+  while i < rounds {
+    let seed = pick(&seeds, &mut gen);
+    let input = mutate(&seed, &mut gen);
+    if kind == 0 {
+      match parse_policy(&input) {
+        Ok(policy) => {
+          let _ = policy_chunks(&policy);
+        }
+        Err(_) => {}
+      }
+    } else if kind == 1 {
+      let _ = parse_ip_table(&input);
+    } else if kind == 2 {
+      let _ = routes(&input);
+    } else if kind == 3 {
+      let _ = read_proxy(&input);
+    } else if exercise_http(&input, &meta, &table, &counters) != 0 {
+      return 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn http_seeds() -> List<Bytes>
+  intent "Valid requests and the known request-smuggling shapes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut seeds = List.new();
+  seeds.push("GET /search?q=books HTTP/1.1\r\nHost: example.test\r\nAccept: */*\r\n\r\n".as_bytes());
+  seeds.push("POST /api HTTP/1.1\r\nHost: example.test\r\nContent-Length: 11\r\nX-Forwarded-For: 198.51.100.7\r\nForwarded: for=198.51.100.7\r\n\r\nhello world".as_bytes());
+  seeds.push("POST /api HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n".as_bytes());
+  seeds.push("POST /api HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n".as_bytes());
+  seeds.push("POST /api HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nabcde".as_bytes());
+  seeds.push("POST /api HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding : chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_bytes());
+  seeds.push("GET /a/../../etc/passwd?u=javascript:x HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n".as_bytes());
+  return seeds;
+}
+
+pub fn main() -> Int
+  intent "Run the fixed-seed short fuzz run over every parser and the inspection path."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let mut gen = Gen { state: 20261128 };
+  let mut policy_seeds = List.new();
+  policy_seeds.push("{\"version\":\"v1\",\"rules\":[{\"id\":\"r1\",\"field\":\"method\",\"op\":\"exact\",\"value\":\"GET\",\"action\":\"block\"},{\"id\":\"r2\",\"field\":\"path\",\"op\":\"prefix\",\"value\":\"/admin\",\"action\":\"log_only\"}]}".as_bytes());
+  let mut table_seeds = List.new();
+  table_seeds.push("{\"version\":\"v1\",\"entries\":[{\"cidr\":\"192.0.2.0/24\",\"effect\":\"record\",\"reason\":\"review\",\"expires_at\":1893456000}]}".as_bytes());
+  let mut route_seeds = List.new();
+  route_seeds.push("[{\"id\":\"verify\",\"path\":\"/auth/verify\"},{\"id\":\"cart\",\"path\":\"/api/cart\"}]".as_bytes());
+  let mut proxy_seeds = List.new();
+  proxy_seeds.push(preface_for(7));
+  return match read_proxy(&preface_for(7)) {
+    Some(meta) => suite(&meta, &mut gen, &policy_seeds, &table_seeds, &route_seeds, &proxy_seeds),
+    None => 10,
+  };
+}
+
+fn suite(meta: &ProxyMetadata, gen: &mut Gen, policy_seeds: &List<Bytes>, table_seeds: &List<Bytes>, route_seeds: &List<Bytes>, proxy_seeds: &List<Bytes>) -> Int
+  intent "Run every target with the shared fixtures."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let rounds = 400;
+  match parse_ip_table(&"{\"version\":\"empty-v1\",\"entries\":[]}".as_bytes()) {
+    Ok(table) => {
+      match limits(1000000, 1000000, 1000000, 1000000, 8) {
+        Some(rates) => {
+          let counters = Lock.new(limiter(rates));
+          if run_kind(0, &policy_seeds, &mut gen, rounds, &meta, &table, &counters) != 0 {
+            return 20;
+          }
+          if run_kind(1, &table_seeds, &mut gen, rounds, &meta, &table, &counters) != 0 {
+            return 21;
+          }
+          if run_kind(2, &route_seeds, &mut gen, rounds, &meta, &table, &counters) != 0 {
+            return 22;
+          }
+          if run_kind(3, &proxy_seeds, &mut gen, rounds, &meta, &table, &counters) != 0 {
+            return 23;
+          }
+          if run_kind(4, &http_seeds(), &mut gen, rounds, &meta, &table, &counters) != 0 {
+            return 24;
+          }
+          return 0;
+        }
+        None => {
+          return 11;
+        }
+      }
+    }
+    Err(_) => {
+      return 12;
+    }
+  }
+}

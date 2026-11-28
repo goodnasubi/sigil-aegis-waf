@@ -1,0 +1,455 @@
+module stage4_budget_test
+  targets server
+  trust none
+
+use aegis_budget.Rejection;
+use aegis_budget.begin_at;
+use aegis_budget.expired;
+use aegis_budget.memory_ceiling;
+use aegis_budget.pinned_limits;
+use aegis_budget.policy_chunks;
+use aegis_budget.settings;
+use aegis_budget.stronger;
+use aegis_http.check_request;
+use aegis_ip.IpTable;
+use aegis_ip.parse_ip_table;
+use aegis_limit.Limits;
+use aegis_limit.limiter;
+use aegis_limit.limits;
+use aegis_observe.Event;
+use aegis_policy.Policy;
+use aegis_policy.RequestInput;
+use aegis_policy.action_rank;
+use aegis_policy.default_managed_policy;
+use aegis_policy.evaluate;
+use aegis_proxy.ProxyMetadata;
+use aegis_proxy.parse_proxy;
+use aegis_routes.routes;
+
+fn repeated(letter: Int, count: Int) -> Bytes
+  intent "Build count copies of one byte."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < count {
+    out.push(letter);
+    i = i + 1;
+  }
+  return out;
+}
+
+fn meta_for(last: Int) -> ProxyMetadata
+  intent "Build a validated PROXY v2 TCP over IPv4 connection from 10.0.0.<last>."
+  requires none
+  ensures none
+  effects none
+{
+  let mut head = "\r\n\r\n\u{0}\r\nQUIT\n".as_bytes();
+  head.push(33);
+  head.push(17);
+  head.push(0);
+  head.push(30);
+  let mut payload = Bytes.new();
+  payload.push(10);
+  payload.push(0);
+  payload.push(0);
+  payload.push(last);
+  payload.extend(&"\u{7F}\u{0}\u{0}\u{1}\u{4}Ò\u{1}»".as_bytes().slice(0, 4).unwrap_or(Bytes.new()));
+  payload.push(4);
+  payload.push(210);
+  payload.push(1);
+  payload.push(187);
+  payload.push(32);
+  payload.push(0);
+  payload.push(15);
+  payload.extend(&"\u{1}\u{0}\u{0}\u{0}\u{0}!\u{0}\u{7}TLSv1.3".as_bytes());
+  return match parse_proxy(&head, &payload) {
+    Ok(meta) => meta,
+    Err(_) => meta_for_failure(),
+  };
+}
+
+fn meta_for_failure() -> ProxyMetadata
+  intent "Unreachable fallback so a malformed fixture fails the test instead of looping."
+  requires none
+  ensures none
+  effects none
+{
+  let mut head = "\r\n\r\n\u{0}\r\nQUIT\n".as_bytes();
+  head.push(33);
+  head.push(17);
+  head.push(0);
+  head.push(30);
+  let mut payload = repeated(1, 12);
+  payload.push(32);
+  payload.push(0);
+  payload.push(15);
+  payload.extend(&"\u{1}\u{0}\u{0}\u{0}\u{0}!\u{0}\u{7}TLSv1.3".as_bytes());
+  return parse_proxy(&head, &payload).unwrap_or(meta_for_failure());
+}
+
+fn parse(text: &Bytes, limits: &HttpLimits) -> Result<HttpRequest, Int>
+  intent "Feed one complete request into the incremental parser."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parser = http.parser(&limits);
+  return match parser.feed(&text, 0) {
+    Ok(HttpProgress.Done(req, _)) => Ok(req),
+    Ok(HttpProgress.NeedMore) => Err(0),
+    Err(e) => Err(e.status()),
+  };
+}
+
+fn parse_status(text: &Bytes, limits: &HttpLimits) -> Int
+  intent "The status that the parser answers, zero when the request is accepted."
+  requires none
+  ensures none
+  effects none
+{
+  return match parse(&text, &limits) {
+    Ok(_) => 0,
+    Err(status) => status,
+  };
+}
+
+fn simple(path: &String) -> HttpRequest
+  intent "A small valid GET request."
+  requires none
+  ensures none
+  effects none
+{
+  let mut text = "GET ".as_bytes();
+  text.extend(&path.as_bytes());
+  text.extend(&" HTTP/1.1\r\nHost: example.test\r\n\r\n".as_bytes());
+  return match parse(&text, &pinned_limits(1048576)) {
+    Ok(req) => req,
+    Err(_) => simple(&"/"),
+  };
+}
+
+fn parser_limits() -> Int
+  intent "The pinned parser limits give 414, 431, 413 and 400 for oversize and ambiguous input."
+  requires none
+  ensures none
+  effects none
+{
+  let limits = pinned_limits(1048576);
+  if limits.request_line() != 8192 || limits.head() != 16384 || limits.headers() != 100 || limits.body() != 1048576 {
+    return 1;
+  }
+  let mut target = "GET /".as_bytes();
+  target.extend(&repeated(97, 8192));
+  target.extend(&" HTTP/1.1\r\nHost: a.test\r\n\r\n".as_bytes());
+  if parse_status(&target, &limits) != 414 {
+    return 2;
+  }
+  let mut at_line = "GET /".as_bytes();
+  at_line.extend(&repeated(97, 8192 - "GET / HTTP/1.1".as_bytes().byte_len()));
+  at_line.extend(&" HTTP/1.1\r\nHost: a.test\r\n\r\n".as_bytes());
+  if parse(&at_line, &limits).is_err() {
+    return 3;
+  }
+  let mut big_head = "GET / HTTP/1.1\r\nHost: a.test\r\nX-Pad: ".as_bytes();
+  big_head.extend(&repeated(98, 16384));
+  big_head.extend(&"\r\n\r\n".as_bytes());
+  if parse_status(&big_head, &limits) != 431 {
+    return 4;
+  }
+  let mut many = "GET / HTTP/1.1\r\nHost: a.test\r\n".as_bytes();
+  let mut i = 0;
+  while i < 100 {
+    many.extend(&"A: b\r\n".as_bytes());
+    i = i + 1;
+  }
+  many.extend(&"\r\n".as_bytes());
+  if parse_status(&many, &limits) != 431 {
+    return 5;
+  }
+  let mut huge = "POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1048577\r\n\r\n".as_bytes();
+  huge.extend(&repeated(99, 16));
+  if parse_status(&huge, &limits) != 413 {
+    return 6;
+  }
+  let small = pinned_limits(1000);
+  let mut capped = "POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1001\r\n\r\n".as_bytes();
+  capped.extend(&repeated(99, 16));
+  if parse_status(&capped, &small) != 413 {
+    return 7;
+  }
+  let mut both = "POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n".as_bytes();
+  both.extend(&"1\r\nx\r\n0\r\n\r\n".as_bytes());
+  if parse_status(&both, &limits) != 400 {
+    return 8;
+  }
+  let mut twice = "POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab".as_bytes();
+  if parse_status(&twice, &limits) != 400 {
+    return 9;
+  }
+  return 0;
+}
+
+fn defaults_and_chunks() -> Int
+  intent "Defaults are the accepted values and the rule set is split into bounded work units."
+  requires none
+  ensures none
+  effects env
+{
+  match settings() {
+    Ok(budget) => {
+      if budget.max_connections != 64 || budget.body_limit != 1048576 || budget.deadline_ns != 10000000 || budget.node_rate != 300 || budget.node_burst != 600 || budget.key_burst != 40 || budget.table_capacity != 256 {
+        return 10;
+      }
+    }
+    Err(_) => {
+      return 11;
+    }
+  }
+  match settings() {
+    Ok(budget) => {
+      // 64 connections x (16 KiB head + 2 x 1 MiB body + 128 KiB task allowance)
+      if memory_ceiling(&budget) != 143654912 {
+        return 16;
+      }
+    }
+    Err(_) => {
+      return 11;
+    }
+  }
+  let policy = default_managed_policy();
+  match policy_chunks(&policy) {
+    Ok(chunks) => {
+      if chunks.len() != (policy.rules().len() + 3) / 4 {
+        return 12;
+      }
+      let mut total = 0;
+      let mut i = 0;
+      while i < chunks.len() {
+        match chunks.get(i) {
+          Some(unit) => {
+            if unit.rules().len() > 4 || unit.version() != policy.version() {
+              return 13;
+            }
+            total = total + unit.rules().len();
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      if total != policy.rules().len() {
+        return 14;
+      }
+    }
+    Err(_) => {
+      return 15;
+    }
+  }
+  return 0;
+}
+
+fn same_as_whole(target: &String, route: &String, path: &String, query: &String) -> Bool
+  intent "Merging per-unit decisions equals evaluating the whole rule set at once."
+  requires none
+  ensures none
+  effects none
+{
+  let policy = default_managed_policy();
+  let input = RequestInput.new(target.clone(), path.clone(), query.clone(), List.new(), Bytes.new(), route.clone());
+  let whole = evaluate(&policy, &List.new(), &input, 0);
+  let chunks = policy_chunks(&policy).unwrap_or(List.new());
+  let mut best = evaluate(&Policy.new(policy.version(), List.new()), &List.new(), &input, 0);
+  let mut i = 0;
+  while i < chunks.len() {
+    match chunks.get(i) {
+      Some(unit) => {
+        best = stronger(best, evaluate(&unit, &List.new(), &input, 0));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return action_rank(&best.action()) == action_rank(&whole.action()) && best.matched_rule_id() == whole.matched_rule_id();
+}
+
+fn merged_decisions() -> Int
+  intent "Chunked evaluation keeps the rule that a single pass would report."
+  requires none
+  ensures none
+  effects none
+{
+  if !same_as_whole(&"GET", &"default", &"/", &"") {
+    return 20;
+  }
+  if !same_as_whole(&"TRACE", &"default", &"/", &"") {
+    return 21;
+  }
+  if !same_as_whole(&"GET", &"default", &"/a/../../etc/passwd", &"") {
+    return 22;
+  }
+  if !same_as_whole(&"GET", &"default", &"/search", &"q=1' or '1'='1") {
+    return 23;
+  }
+  if !same_as_whole(&"GET", &"default", &"/search", &"q=<script>alert(1)</script>") {
+    return 24;
+  }
+  if !same_as_whole(&"GET", &"default", &"/admin", &"") {
+    return 25;
+  }
+  return 0;
+}
+
+fn status_of(outcome: &Result<Bytes, Rejection>) -> Int
+  intent "Read the status of a rejection, or zero when forwarded."
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Ok(_) => 0,
+    Err(rejected) => rejected.status(),
+  };
+}
+
+fn has_reason(observations: &List<Event>, reason: &String) -> Bool
+  intent "True when an observation carries the reason code."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < observations.len() {
+    match observations.get(i) {
+      Some(item) => {
+        if item.reason == reason {
+          return true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn deadline_and_flow() -> Int
+  intent "Deadlines are checked at the start, at each work unit and before forwarding, and expiry rejects."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let now = clock.monotonic_nanos().unwrap_or(0);
+  let mut late = begin_at(now - 1000000000, 10000000);
+  let mut fresh = begin_at(now, 10000000000);
+  if !expired(&mut late) || expired(&mut fresh) || late.checks != 1 || fresh.checks != 1 {
+    return 30;
+  }
+  return match parse_ip_table(&"{\"version\":\"empty-v1\",\"entries\":[]}".as_bytes()) {
+    Ok(table) => match limits(1000, 1000, 1000, 1000, 8) {
+      Some(roomy) => match limits(1, 1, 1, 1, 8) {
+        Some(tight) => match limits(1000, 1000, 1, 1, 1) {
+          Some(full) => flow(&table, roomy, tight, full),
+          None => 31,
+        },
+        None => 31,
+      },
+      None => 31,
+    },
+    Err(_) => 31,
+  };
+}
+
+fn flow(table: &IpTable, roomy_limits: Limits, tight_limits: Limits, full_limits: Limits) -> Int
+  intent "Run the request path with a fresh and an expired deadline and with a small rate table."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let now = clock.monotonic_nanos().unwrap_or(0);
+  let chunks = policy_chunks(&default_managed_policy()).unwrap_or(List.new());
+  let no_routes = routes(&"[]".as_bytes()).unwrap_or(List.new());
+  let meta = meta_for(7);
+  let roomy = Lock.new(limiter(roomy_limits));
+  let req = simple(&"/");
+
+  let mut on_time = begin_at(now, 10000000000);
+  let mut seen = List.new();
+  let passed = check_request(&req, &meta, 0, &table, &chunks, &no_routes, &roomy, &mut on_time, &mut seen);
+  if status_of(&passed) != 0 || on_time.checks != 2 + chunks.len() || seen.len() != 0 {
+    return 32;
+  }
+  match passed {
+    Ok(wire) => {
+      if wire.slice(0, 16).unwrap_or(Bytes.new()) != "GET / HTTP/1.1\r\n".as_bytes() {
+        return 33;
+      }
+    }
+    Err(_) => {
+      return 34;
+    }
+  }
+
+  let mut overdue = begin_at(now - 1000000000, 10000000);
+  let mut recorded = List.new();
+  let refused = check_request(&req, &meta, 0, &table, &chunks, &no_routes, &roomy, &mut overdue, &mut recorded);
+  if status_of(&refused) != 503 || !has_reason(&recorded, &"decision_deadline") || overdue.checks != 1 {
+    return 35;
+  }
+
+  let tight = Lock.new(limiter(tight_limits));
+  let mut a = begin_at(now, 10000000000);
+  let mut b = begin_at(now, 10000000000);
+  let mut noted = List.new();
+  let first = check_request(&req, &meta, 0, &table, &chunks, &no_routes, &tight, &mut a, &mut noted);
+  let second = check_request(&req, &meta, 0, &table, &chunks, &no_routes, &tight, &mut b, &mut noted);
+  if status_of(&first) != 0 || status_of(&second) != 429 || !has_reason(&noted, &"rate_limited") {
+    return 36;
+  }
+  match second {
+    Err(rejected) => {
+      if rejected.retry_after() < 1 {
+        return 37;
+      }
+    }
+    Ok(_) => {
+      return 38;
+    }
+  }
+
+  let full = Lock.new(limiter(full_limits));
+  let mut c = begin_at(now, 10000000000);
+  let mut d = begin_at(now, 10000000000);
+  let mut e = begin_at(now, 10000000000);
+  let mut table_notes = List.new();
+  let held = check_request(&req, &meta_for(1), 0, &table, &chunks, &no_routes, &full, &mut c, &mut table_notes);
+  let new_key = check_request(&req, &meta_for(2), 0, &table, &chunks, &no_routes, &full, &mut d, &mut table_notes);
+  let old_key = check_request(&req, &meta_for(1), 0, &table, &chunks, &no_routes, &full, &mut e, &mut table_notes);
+  if status_of(&held) != 0 || status_of(&new_key) != 503 || status_of(&old_key) != 429 || !has_reason(&table_notes, &"rate_table_full") {
+    return 39;
+  }
+  return 0;
+}
+
+pub fn main() -> Int
+  intent "Run the stage 4 budget tests."
+  requires none
+  ensures none
+  effects clock, env, task.share, task.suspend
+{
+  let first = parser_limits();
+  if first != 0 {
+    return first;
+  }
+  let second = defaults_and_chunks();
+  if second != 0 {
+    return second;
+  }
+  let third = merged_decisions();
+  if third != 0 {
+    return third;
+  }
+  return deadline_and_flow();
+}
