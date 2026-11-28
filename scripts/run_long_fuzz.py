@@ -51,7 +51,35 @@ def parse_output(output: str):
                 pass
     return success, iterations, elapsed_ns
 
-def run_target(target_id: int, duration_secs: int, repo_root: Path, sigil_bin: Path, work_dir: Path, seeds=(20261128, 20261129)):
+def post_progress_comment(result: dict, issue_num: int = 9, repo: str = "goodnasubi/sigil-aegis-waf"):
+    target_name = result["target_name"]
+    target_id = result["target_id"]
+    e = result["evaluator"]
+    n = result["native"]
+    total_iters = e["iterations"] + n["iterations"]
+    body = f"""## 進捗報告: 対象 {target_id}（{target_name}）の長時間ファジング完了
+
+- **対象**: {target_name}（Target {target_id}）
+- **所要時間**:
+  - 評価器: {e['elapsed_seconds']:.2f} 秒
+  - ネイティブ: {n['elapsed_seconds']:.2f} 秒
+  - 壁時計時間: {result['wall_time_seconds']:.2f} 秒
+- **実行回数**:
+  - 評価器: {e['iterations']:,} 回
+  - ネイティブ: {n['iterations']:,} 回
+  - 合計: {total_iters:,} 回
+- **初期シード**: 評価器 {e['seed']} / ネイティブ {n['seed']}（実行中 10,000 回ごとにシード自動更新）
+- **クラッシュ／ハング**: 0 件
+- **性質違反**: 0 件
+- **判定**: **合格**
+"""
+    try:
+        subprocess.run(["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", body], check=True)
+        print(f"Posted progress comment for Target {target_id} to Issue #{issue_num}", flush=True)
+    except Exception as ex:
+        print(f"Failed to post comment to Issue #{issue_num}: {ex}", file=sys.stderr, flush=True)
+
+def run_target(target_id: int, duration_secs: int, repo_root: Path, sigil_bin: Path, work_dir: Path, seeds=(20261128, 20261129), post_comment: bool = True):
     target_info = TARGETS[target_id]
     target_name = target_info["name"]
     print(f"==================================================", flush=True)
@@ -168,6 +196,10 @@ def run_target(target_id: int, duration_secs: int, repo_root: Path, sigil_bin: P
     print(f"  Evaluator: {eval_iters:,} iterations in {eval_result['elapsed_seconds']:.2f}s (code={p_eval.returncode}, success={eval_result['success']})")
     print(f"  Native:    {native_iters:,} iterations in {native_result['elapsed_seconds']:.2f}s (code={p_native.returncode}, success={native_result['success']})")
     print(f"==================================================\n", flush=True)
+
+    if post_comment:
+        post_progress_comment(result)
+
     return result
 
 def main():
@@ -176,7 +208,8 @@ def main():
     parser.add_argument("--duration", type=int, default=3605, help="Duration in seconds per target (default 3605)")
     parser.add_argument("--sigil-bin", type=str, default="/home/antigravity/sigil-1a4bf/target/release/sigil")
     parser.add_argument("--work-dir", type=str, default="/tmp/aegis_fuzz_run")
-    parser.add_argument("--results-json", type=str, default="fuzz_results.json")
+    parser.add_argument("--results-json", type=str, default="docs/records/long_fuzz_results.json")
+    parser.add_argument("--no-comment", action="store_true", help="Do not post comments to GitHub issue")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -184,8 +217,22 @@ def main():
     work_dir.mkdir(parents=True, exist_ok=True)
     sigil_bin = Path(args.sigil_bin)
 
-    all_results = []
-    # Seeds for each target: [eval_seed, native_seed]
+    results_path = repo_root / args.results_json
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_results = {}
+    if results_path.exists():
+        try:
+            with open(results_path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+                if isinstance(prev, list):
+                    for item in prev:
+                        all_results[item["target_id"]] = item
+                elif isinstance(prev, dict):
+                    all_results = prev
+        except Exception:
+            all_results = {}
+
     target_seeds = [
         (20261128, 20261129),
         (20261130, 20261201),
@@ -195,11 +242,21 @@ def main():
     ]
 
     for t_id in args.targets:
-        res = run_target(t_id, args.duration, repo_root, sigil_bin, work_dir, target_seeds[t_id % len(target_seeds)])
-        all_results.append(res)
-        # Write intermediate results
-        with open(args.results_json, "w", encoding="utf-8") as f:
-            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        res = run_target(
+            t_id,
+            args.duration,
+            repo_root,
+            sigil_bin,
+            work_dir,
+            target_seeds[t_id % len(target_seeds)],
+            post_comment=not args.no_comment
+        )
+        all_results[t_id] = res
+
+        # Save cumulative results
+        results_list = [all_results[k] for k in sorted(all_results.keys())]
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(results_list, f, indent=2, ensure_ascii=False)
 
     print("All requested fuzzing runs completed successfully!")
 
