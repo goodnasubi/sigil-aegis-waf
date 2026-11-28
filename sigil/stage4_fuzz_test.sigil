@@ -246,6 +246,50 @@ fn http_seeds() -> List<Bytes>
   return seeds;
 }
 
+fn policy_seeds() -> List<Bytes>
+  intent "Seed inputs for policy JSON parser."
+  requires none
+  ensures none
+  effects none
+{
+  let mut seeds = List.new();
+  seeds.push("{\"version\":\"v1\",\"rules\":[{\"id\":\"r1\",\"field\":\"method\",\"op\":\"exact\",\"value\":\"GET\",\"action\":\"block\"},{\"id\":\"r2\",\"field\":\"path\",\"op\":\"prefix\",\"value\":\"/admin\",\"action\":\"log_only\"}]}".as_bytes());
+  return seeds;
+}
+
+fn table_seeds() -> List<Bytes>
+  intent "Seed inputs for CIDR IP table parser."
+  requires none
+  ensures none
+  effects none
+{
+  let mut seeds = List.new();
+  seeds.push("{\"version\":\"v1\",\"entries\":[{\"cidr\":\"192.0.2.0/24\",\"effect\":\"record\",\"reason\":\"review\",\"expires_at\":1893456000}]}".as_bytes());
+  return seeds;
+}
+
+fn route_seeds() -> List<Bytes>
+  intent "Seed inputs for route table parser."
+  requires none
+  ensures none
+  effects none
+{
+  let mut seeds = List.new();
+  seeds.push("[{\"id\":\"verify\",\"path\":\"/auth/verify\"},{\"id\":\"cart\",\"path\":\"/api/cart\"}]".as_bytes());
+  return seeds;
+}
+
+fn proxy_seeds() -> List<Bytes>
+  intent "Seed inputs for PROXY v2 parser."
+  requires none
+  ensures none
+  effects none
+{
+  let mut seeds = List.new();
+  seeds.push(preface_for(7));
+  return seeds;
+}
+
 pub fn main() -> Int
   intent "Run the fixed-seed short fuzz run over every parser and the inspection path."
   requires none
@@ -253,18 +297,103 @@ pub fn main() -> Int
   effects clock, task.share, task.suspend
 {
   let mut gen = Gen { state: 20261128 };
-  let mut policy_seeds = List.new();
-  policy_seeds.push("{\"version\":\"v1\",\"rules\":[{\"id\":\"r1\",\"field\":\"method\",\"op\":\"exact\",\"value\":\"GET\",\"action\":\"block\"},{\"id\":\"r2\",\"field\":\"path\",\"op\":\"prefix\",\"value\":\"/admin\",\"action\":\"log_only\"}]}".as_bytes());
-  let mut table_seeds = List.new();
-  table_seeds.push("{\"version\":\"v1\",\"entries\":[{\"cidr\":\"192.0.2.0/24\",\"effect\":\"record\",\"reason\":\"review\",\"expires_at\":1893456000}]}".as_bytes());
-  let mut route_seeds = List.new();
-  route_seeds.push("[{\"id\":\"verify\",\"path\":\"/auth/verify\"},{\"id\":\"cart\",\"path\":\"/api/cart\"}]".as_bytes());
-  let mut proxy_seeds = List.new();
-  proxy_seeds.push(preface_for(7));
+  let p_seeds = policy_seeds();
+  let t_seeds = table_seeds();
+  let r_seeds = route_seeds();
+  let prx_seeds = proxy_seeds();
   return match read_proxy(&preface_for(7)) {
-    Some(meta) => suite(&meta, &mut gen, &policy_seeds, &table_seeds, &route_seeds, &proxy_seeds),
+    Some(meta) => suite(&meta, &mut gen, &p_seeds, &t_seeds, &r_seeds, &prx_seeds),
     None => 10,
   };
+}
+
+pub fn run_target_timed(target: Int, seed: Int, duration_secs: Int) -> Int
+  intent "Run a single target for at least duration_secs seconds with multiple seeds derived from initial seed."
+  requires none
+  ensures none
+  effects clock, console, task.share, task.suspend
+{
+  let initial_state = match seed % 2147483647 == 0 {
+    true => 1,
+    false => seed % 2147483647,
+  };
+  let mut gen = Gen { state: initial_state };
+  let p_seeds = policy_seeds();
+  let t_seeds = table_seeds();
+  let r_seeds = route_seeds();
+  let prx_seeds = proxy_seeds();
+  let h_seeds = http_seeds();
+
+  match read_proxy(&preface_for(7)) {
+    Some(meta) => {
+      match parse_ip_table(&"{\"version\":\"empty-v1\",\"entries\":[]}".as_bytes()) {
+        Ok(table) => {
+          match limits(1000000, 1000000, 1000000, 1000000, 8) {
+            Some(rates) => {
+              let counters = Lock.new(limiter(rates));
+              let start_ns = clock.monotonic_nanos().unwrap_or(0);
+              let target_ns = duration_secs * 1000000000;
+              let batch = 500;
+              let mut total_iters = 0;
+              let mut last_log_ns = start_ns;
+              let mut now = start_ns;
+
+              console.log(&"START_TARGET");
+              console.log(&target);
+              console.log(&seed);
+
+              while now - start_ns < target_ns {
+                let mut err = 0;
+                if target == 0 {
+                  err = run_kind(0, &p_seeds, &mut gen, batch, &meta, &table, &counters);
+                } else if target == 1 {
+                  err = run_kind(1, &t_seeds, &mut gen, batch, &meta, &table, &counters);
+                } else if target == 2 {
+                  err = run_kind(2, &r_seeds, &mut gen, batch, &meta, &table, &counters);
+                } else if target == 3 {
+                  err = run_kind(3, &prx_seeds, &mut gen, batch, &meta, &table, &counters);
+                } else {
+                  err = run_kind(4, &h_seeds, &mut gen, batch, &meta, &table, &counters);
+                }
+                if err != 0 {
+                  console.log(&"ERROR_VIOLATION");
+                  console.log(&err);
+                  return 20 + target;
+                }
+                total_iters = total_iters + batch;
+
+                if total_iters % 10000 == 0 {
+                  gen.state = (gen.state + 1234567) % 2147483646 + 1;
+                }
+
+                now = clock.monotonic_nanos().unwrap_or(start_ns + target_ns);
+                if now - last_log_ns >= 30000000000 {
+                  console.log(&"PROGRESS_ITERS");
+                  console.log(&total_iters);
+                  last_log_ns = now;
+                }
+              }
+
+              let elapsed_ns = now - start_ns;
+              console.log(&"FINISH_SUCCESS");
+              console.log(&total_iters);
+              console.log(&elapsed_ns);
+              return 0;
+            }
+            None => {
+              return 11;
+            }
+          }
+        }
+        Err(_) => {
+          return 12;
+        }
+      }
+    }
+    None => {
+      return 10;
+    }
+  }
 }
 
 fn suite(meta: &ProxyMetadata, gen: &mut Gen, policy_seeds: &List<Bytes>, table_seeds: &List<Bytes>, route_seeds: &List<Bytes>, proxy_seeds: &List<Bytes>) -> Int
