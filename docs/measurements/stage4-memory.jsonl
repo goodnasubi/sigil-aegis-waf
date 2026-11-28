@@ -1,0 +1,2 @@
+{"max_connections": 8, "client_threads": 8, "request": "1MiB body", "statuses": {"503": 1, "200": 31}, "idle_peak_rss_kib": 1908, "peak_rss_kib": 20496}
+{"max_connections": 64, "client_threads": 64, "request": "1MiB body", "statuses": {"0": 2, "200": 179, "502": 12, "503": 2}, "idle_peak_rss_kib": 1912, "peak_rss_kib": 124964}

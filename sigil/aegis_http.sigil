@@ -2,13 +2,23 @@ module aegis_http
   targets server
   trust none
 
+use aegis_budget.Inspection;
+use aegis_budget.Rejection;
+use aegis_budget.expired;
+use aegis_budget.pinned_limits;
+use aegis_budget.rejection;
+use aegis_budget.stronger;
 use aegis_ip.IpEffect;
 use aegis_ip.IpTable;
 use aegis_ip.evaluate_ip;
 use aegis_ip.ip_version;
+use aegis_limit.Admission;
+use aegis_limit.Limiter;
+use aegis_limit.admit;
 use aegis_observe.Event;
 use aegis_observe.event;
 use aegis_policy.Action;
+use aegis_policy.Decision;
 use aegis_policy.Header;
 use aegis_policy.Policy;
 use aegis_policy.RequestInput;
@@ -48,14 +58,39 @@ fn decimal(n: Int) -> Bytes
   return digits;
 }
 
-pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table: &IpTable, policy: &Policy, routes: &List<Route>, observations: &mut List<Event>) -> Result<Bytes, Int>
-  intent "検査を終えた要求だけを一意のフレーミングで組み立てる"
+fn version_of(chunks: &List<Policy>) -> String
+  intent "Read the policy version shared by every work unit."
   requires none
   ensures none
-  effects clock, task.suspend
+  effects none
 {
+  return match chunks.get(0) {
+    Some(unit) => unit.version(),
+    None => "",
+  };
+}
+
+fn late(route: &String, chunks: &List<Policy>, observations: &mut List<Event>) -> Rejection
+  intent "Reject a request whose inspection deadline has passed; nothing unchecked is forwarded."
+  requires none
+  ensures none
+  effects none
+{
+  observations.push(event("reject", "decision_deadline", "", route.clone(), version_of(&chunks), false, false));
+  return rejection(503, 0);
+}
+
+pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table: &IpTable, chunks: &List<Policy>, routes: &List<Route>, counters: &Lock<Limiter>, watch: &mut Inspection, observations: &mut List<Event>) -> Result<Bytes, Rejection>
+  intent "検査を終えた要求だけを一意のフレーミングで組み立て、期限とレート制限を適用する"
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  if expired(&mut watch) {
+    return Err(late(&"default", &chunks, &mut observations));
+  }
   if req.version() != 11 {
-    return Err(505);
+    return Err(rejection(505, 0));
   }
   let host = req.header(&"host").unwrap_or(Bytes.new());
   match authority(&meta) {
@@ -63,17 +98,17 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table
       match host_name(&host) {
         Ok(name) => {
           if sni != name {
-            return Err(421);
+            return Err(rejection(421, 0));
           }
         }
         Err(_) => {
-          return Err(421);
+          return Err(rejection(421, 0));
         }
       }
     }
     None => {
       if host.byte_len() == 0 {
-        return Err(400);
+        return Err(rejection(400, 0));
       }
     }
   }
@@ -83,7 +118,7 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table
   let path_text = path.to_string_utf8();
   let query_text = query.to_string_utf8();
   if path_text.is_err() || query_text.is_err() {
-    return Err(400);
+    return Err(rejection(400, 0));
   }
   let mut input_headers = List.new();
   let mut wire_headers = Bytes.new();
@@ -97,13 +132,13 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table
         let value = header.value();
         let text = value.to_string_utf8();
         if text.is_err() {
-          return Err(400);
+          return Err(rejection(400, 0));
         }
         let value_text = text.unwrap_or("");
         if name == "connection" {
           let option = to_ascii_lower(&value_text);
           if option != "close" && option != "keep-alive" {
-            return Err(400);
+            return Err(rejection(400, 0));
           }
         }
         input_headers.push(Header.new(name.clone(), value_text));
@@ -123,7 +158,7 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table
   match evaluate_ip(&ip_table, &source(&meta), now) {
     IpEffect.Block(reason) => {
       observations.push(event("block", reason, "", route.clone(), ip_version(&ip_table), false, true));
-      return Err(403);
+      return Err(rejection(403, 0));
     }
     IpEffect.Record(reason) => {
       observations.push(event("detect", reason, "", route.clone(), ip_version(&ip_table), false, true));
@@ -138,24 +173,55 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table
     header_count = header_count + 1;
   }
   wire_headers.extend(&"connection: close\r\n".as_bytes());
-  let limits = http.default_limits();
-  if wire_headers.byte_len() > limits.head() || header_count > limits.headers() {
-    return Err(431);
+  if wire_headers.byte_len() > pinned_limits(1).head() || header_count > pinned_limits(1).headers() {
+    return Err(rejection(431, 0));
+  }
+
+  // 経路の確定後、本文の検査前に制限を適用する（ADR 0068 決定 4）。
+  match clock.monotonic_nanos() {
+    Some(tick) => {
+      match admit(&counters, &source(&meta), &route, tick) {
+        Admission.Allow => {}
+        Admission.Limited(seconds) => {
+          observations.push(event("reject", "rate_limited", "", route.clone(), version_of(&chunks), false, false));
+          return Err(rejection(429, seconds));
+        }
+        Admission.Unavailable => {
+          observations.push(event("reject", "rate_table_full", "", route.clone(), version_of(&chunks), false, false));
+          return Err(rejection(503, 0));
+        }
+      }
+    }
+    None => {
+      return Err(late(&route, &chunks, &mut observations));
+    }
   }
 
   let method = req.method();
   let input = RequestInput.new(method.clone(), path_text.unwrap_or(""), query_text.unwrap_or(""), input_headers, body.clone(), route.clone());
-  // 期限をスケジューラーが処理できるよう、正規化と評価の間で中断する。
-  task.sleep(0);
-  let decision = evaluate(&policy, &List.new(), &input, now);
+  // 作業単位（ルール数を限った一括）ごとに期限を確かめる。作業単位の間では制御を手放さない。
+  let mut decision = Decision.new(Action.Pass, None, None, version_of(&chunks));
+  let mut unit = 0;
+  while unit < chunks.len() {
+    if expired(&mut watch) {
+      return Err(late(&route, &chunks, &mut observations));
+    }
+    match chunks.get(unit) {
+      Some(rules) => {
+        decision = stronger(decision, evaluate(&rules, &List.new(), &input, now));
+      }
+      None => {}
+    }
+    unit = unit + 1;
+  }
   match decision.action() {
     Action.Block => {
       observations.push(event("block", "policy_block", decision.matched_rule_id().unwrap_or(""), route.clone(), decision.policy_version(), false, true));
-      return Err(403);
+      return Err(rejection(403, 0));
     }
     Action.Challenge => {
       observations.push(event("challenge", "challenge_required", decision.matched_rule_id().unwrap_or(""), route.clone(), decision.policy_version(), false, true));
-      return Err(403);
+      return Err(rejection(403, 0));
     }
     Action.LogOnly => {
       observations.push(event("detect", "log_only", decision.matched_rule_id().unwrap_or(""), route.clone(), decision.policy_version(), false, true));
@@ -174,6 +240,8 @@ pub fn check_request(req: &HttpRequest, meta: &ProxyMetadata, now: Int, ip_table
   request.extend(&wire_headers);
   request.extend(&"\r\n".as_bytes());
   request.extend(&body);
-  task.sleep(0);
+  if expired(&mut watch) {
+    return Err(late(&route, &chunks, &mut observations));
+  }
   return Ok(request);
 }

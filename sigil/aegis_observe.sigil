@@ -22,6 +22,7 @@ pub struct Event {
 
 pub struct Pending {
   items: List<Event>,
+  decisions: List<Int>,
   requests: Int,
   detections: Int,
   dropped: Int,
@@ -39,7 +40,30 @@ pub fn observer(port: Int, capacity: Int) -> Observer
   ensures none
   effects none
 {
-  return Observer { port: port, capacity: capacity, pending: Lock.new(Pending { items: List.new(), requests: 0, detections: 0, dropped: 0 }) };
+  return Observer { port: port, capacity: capacity, pending: Lock.new(Pending { items: List.new(), decisions: List.new(), requests: 0, detections: 0, dropped: 0 }) };
+}
+
+pub fn observe_decision(output: &Observer, nanos: Int)
+  intent "Queue one inspection duration without a network call; a full queue is counted as a loss."
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  if output.port == 0 {
+    return;
+  }
+  match output.pending.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let pending = held.get_mut();
+      if pending.decisions.len() < output.capacity {
+        pending.decisions.push(nanos);
+      } else {
+        pending.dropped = pending.dropped + 1;
+      }
+    }
+    Err(_) => {}
+  }
 }
 
 pub fn event(outcome: String, reason: String, rule: String, route: String, version: String, request: Bool, detection: Bool) -> Event
@@ -95,13 +119,14 @@ fn take(output: &Observer) -> Pending
       let pending = held.get_mut();
       let batch = pending.clone();
       pending.items = List.new();
+      pending.decisions = List.new();
       pending.requests = 0;
       pending.detections = 0;
       pending.dropped = 0;
       return batch;
     }
     Err(_) => {
-      return Pending { items: List.new(), requests: 0, detections: 0, dropped: 0 };
+      return Pending { items: List.new(), decisions: List.new(), requests: 0, detections: 0, dropped: 0 };
     }
   }
 }
@@ -269,7 +294,61 @@ fn counter(name: &String) -> Result<Metric, Int>
   return metric(&"sigil-aegis-waf", &name, MetricKind.Counter, &List.new()).map_err(|error| 1);
 }
 
-fn worker(output: &Observer, mut_requests: Metric, mut_detections: Metric, mut_losses: Metric) -> Int
+pub fn flush_interval() -> Int
+  intent "Seconds between cumulative snapshots; the snapshot work stays off the request path most of the time."
+  requires none
+  ensures none
+  effects none
+{
+  return 5;
+}
+
+pub fn decision_bounds() -> List<Float>
+  intent "Fixed histogram bounds in seconds around the 2 ms target and the 10 ms deadline."
+  requires none
+  ensures none
+  effects none
+{
+  let mut bounds = List.new();
+  bounds.push(0.0001);
+  bounds.push(0.00025);
+  bounds.push(0.0005);
+  bounds.push(0.001);
+  bounds.push(0.002);
+  bounds.push(0.005);
+  bounds.push(0.01);
+  return bounds;
+}
+
+fn flush_all(port: Int, sample: &Metric, ts: &String) -> Bool
+  intent "Deliver every sample line of one cumulative metric."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  match sample.snapshot(&ts) {
+    Ok(lines) => {
+      let mut i = 0;
+      while i < lines.len() {
+        match lines.get(i) {
+          Some(line) => {
+            if !deliver(port, &line) {
+              return false;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      return true;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+fn worker(output: &Observer, mut_requests: Metric, mut_detections: Metric, mut_losses: Metric, mut_decisions: Metric) -> Int
   intent "Drain independently of requests and report cumulative losses after recovery."
   requires none
   ensures none
@@ -278,6 +357,7 @@ fn worker(output: &Observer, mut_requests: Metric, mut_detections: Metric, mut_l
   let mut requests = mut_requests;
   let mut detections = mut_detections;
   let mut losses = mut_losses;
+  let mut decisions = mut_decisions;
   let mut last = 0 - 1;
   let mut dirty = false;
   while true {
@@ -291,9 +371,20 @@ fn worker(output: &Observer, mut_requests: Metric, mut_detections: Metric, mut_l
           let _ = detections.record(to_float(batch.detections));
           dirty = true;
         }
+        let mut i = 0;
+        while i < batch.decisions.len() {
+          match batch.decisions.get(i) {
+            Some(nanos) => {
+              let _ = decisions.record(to_float(nanos) / 1000000000.0);
+              dirty = true;
+            }
+            None => {}
+          }
+          i = i + 1;
+        }
         let mut dropped = batch.dropped;
         let mut healthy = true;
-        let mut i = 0;
+        i = 0;
         while i < batch.items.len() {
           match batch.items.get(i) {
             Some(item) => {
@@ -319,12 +410,13 @@ fn worker(output: &Observer, mut_requests: Metric, mut_detections: Metric, mut_l
           let _ = losses.record(to_float(dropped));
           dirty = true;
         }
-        if dirty && healthy && seconds > last {
+        if dirty && healthy && seconds >= last + flush_interval() {
           last = seconds;
           let loss_ok = flush(output.port, &losses, &ts);
           let requests_ok = loss_ok && flush(output.port, &requests, &ts);
           let detections_ok = requests_ok && flush(output.port, &detections, &ts);
-          dirty = !detections_ok;
+          let decisions_ok = detections_ok && flush_all(output.port, &decisions, &ts);
+          dirty = !decisions_ok;
         }
       }
       None => {}
@@ -342,5 +434,6 @@ pub fn run(output: &Observer) -> Result<Int, Int>
   if output.port == 0 {
     return Ok(0);
   }
-  return Ok(worker(&output, counter(&"waf_requests_total")?, counter(&"waf_detections_total")?, counter(&"waf_telemetry_dropped_total")?));
+  let histogram = metric(&"sigil-aegis-waf", &"waf_decision_seconds", MetricKind.Histogram(decision_bounds()), &List.new()).map_err(|error| 1)?;
+  return Ok(worker(&output, counter(&"waf_requests_total")?, counter(&"waf_detections_total")?, counter(&"waf_telemetry_dropped_total")?, histogram));
 }

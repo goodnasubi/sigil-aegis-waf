@@ -142,13 +142,22 @@ class Stage3Loopback(unittest.TestCase):
             return summary.get("last", 0) == len(replies) + 1
 
         self.eventually(requests_total)
+
+        def decisions():
+            summary = self.sample(collector, "metrics?component=sigil-aegis-waf&name=waf_decision_seconds_count")
+            return summary.get("last", 0) >= 1
+
+        self.eventually(decisions)
         for line, ack in received:
             self.assertEqual(ack, b"OK\n")
             self.assertLessEqual(len(line), 65536)
             for secret in (b"raw-query-secret", b"header-secret", b"body-secret", b"/auth/verify", str(ip).encode(), b"198.51.100."):
                 self.assertNotIn(secret, line)
             sample = json.loads(line)
-            if "labels" in sample:
+            if sample.get("name") == "waf_decision_seconds_bucket":
+                self.assertEqual(set(sample["labels"]), {"component", "le"})
+                self.assertEqual(sample["labels"]["component"], "sigil-aegis-waf")
+            elif "labels" in sample:
                 self.assertEqual(sample["labels"], {"component": "sigil-aegis-waf"})
             else:
                 self.assertNotIn("trace_id", sample)

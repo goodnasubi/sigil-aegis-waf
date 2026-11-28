@@ -101,15 +101,20 @@ AEGIS_PORT=8080 AEGIS_UPSTREAM_PORT=8081 ./aegis
 
 ### Sigil 側の追補
 
-Sigil の固定版がアプリ向けに公開する時計は `clock.unix_seconds()` の壁時計です。
-ランタイム内の `std.os.io.io_now` は `trust none` の部品から呼び出せません。
-Sigil 側で単調時間を取得する公開 API が必要です。それまで、本リポジトリの
-トークンバケットは時刻を注入した試験で動作を検証し、ゲートウェイへの接続
-（429、`Retry-After`、容量超過の HTTP 503）と `waf_decision_seconds`
-のヒストグラムは保留します。
+第3段の時点では単調時間の公開 API が無く、ゲートウェイへの接続は保留でした。
+Sigil `1a4bf74`（PR #778）の `clock.monotonic_nanos()` により、第4段でレート制限
+（429、`Retry-After`、表の満杯時の 503）と `waf_decision_seconds` を接続しました。
 
 標準 HTTP パーサーはヘッダー受信済みの状態を公開しますが、検証済みの
 ヘッダー・パスを得られるのは `HttpProgress.Done` の時点です。
 現時点の IP 評価は HTTP の受信とフレーミングの完了後、WAF の本文ポリシー
 評価前に行います。本文受信自体に先行する判定には、Sigil 側で検証済みの
 要求ヘッドを渡せるパーサー API が必要です。
+
+## 第4段（配備条件と計測）
+
+制限値（要求行 8 KiB、ヘッダー 16 KiB・100 件、本文 1 MiB、検査期限 10 ms）、
+状態コード（414/431/413/408/503/400/429）、`waf_decision_seconds`、計測結果、
+誤検知対応・ロールバック・既知の制約は [docs/stage4-deploy.md](docs/stage4-deploy.md)、
+ADR 0020 の完了記録は [docs/records/g2-stage4.md](docs/records/g2-stage4.md) にあります。
+期限の確認には Sigil の単調時計 API（`clock.monotonic_nanos()`）を使います。

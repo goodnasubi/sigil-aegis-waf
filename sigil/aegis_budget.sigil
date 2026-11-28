@@ -1,0 +1,268 @@
+module aegis_budget
+  targets server
+  trust none
+
+use aegis_policy.Decision;
+use aegis_policy.Policy;
+use aegis_policy.action_rank;
+use aegis_policy.max_rules;
+
+// ADR 0068 決定 6 の受け入れ値。ここを変えるときは決定 6 と docs/stage4-deploy.md を改訂する。
+pub struct Settings {
+  max_connections: Int,
+  receive_ms: Int,
+  connect_ms: Int,
+  relay_ms: Int,
+  body_limit: Int,
+  deadline_ns: Int,
+  node_rate: Int,
+  node_burst: Int,
+  key_rate: Int,
+  key_burst: Int,
+  table_capacity: Int,
+}
+
+// 検査期限の状態。checks は期限を確かめた回数で、試験が確認箇所を数えるために使う。
+pub struct Inspection {
+  started: Int,
+  budget: Int,
+  checks: Int,
+}
+
+// 応答する状態コードと、算出できる場合の Retry-After 秒（0 は付けない）。
+pub struct Rejection {
+  code: Int,
+  wait: Int,
+}
+
+impl Rejection {
+  pub fn status(self: &Rejection) -> Int
+    intent "Read the response status."
+    requires none
+    ensures none
+    effects none
+  {
+    return self.code;
+  }
+
+  pub fn retry_after(self: &Rejection) -> Int
+    intent "Read the Retry-After seconds, or zero when none is sent."
+    requires none
+    ensures none
+    effects none
+  {
+    return self.wait;
+  }
+}
+
+pub fn rejection(code: Int, wait: Int) -> Rejection
+  intent "Describe a rejecting response."
+  requires none
+  ensures none
+  effects none
+{
+  return Rejection { code: code, wait: wait };
+}
+
+pub fn request_line_limit() -> Int
+  intent "The accepted request line size in bytes (ADR 0068 decision 6)."
+  requires none
+  ensures none
+  effects none
+{
+  return 8192;
+}
+
+pub fn head_limit() -> Int
+  intent "The accepted header section size in bytes (ADR 0068 decision 6)."
+  requires none
+  ensures none
+  effects none
+{
+  return 16384;
+}
+
+pub fn header_count_limit() -> Int
+  intent "The accepted header count (ADR 0068 decision 6)."
+  requires none
+  ensures none
+  effects none
+{
+  return 100;
+}
+
+pub fn body_limit_max() -> Int
+  intent "The accepted body size in bytes (ADR 0068 decision 6)."
+  requires none
+  ensures none
+  effects none
+{
+  return 1048576;
+}
+
+pub fn deadline_max_ns() -> Int
+  intent "The absolute inspection deadline in nanoseconds (ADR 0068 decision 6)."
+  requires none
+  ensures none
+  effects none
+{
+  return 10000000;
+}
+
+pub fn rules_per_unit() -> Int
+  intent "The number of rules evaluated between two deadline checks."
+  requires none
+  ensures none
+  effects none
+{
+  return 4;
+}
+
+pub fn pinned_limits(body: Int) -> HttpLimits
+  intent "Pin the parser limits to the accepted values whatever the standard defaults are."
+  requires none
+  ensures none
+  effects none
+{
+  return http.default_limits().with_request_line(request_line_limit()).with_head(head_limit()).with_headers(header_count_limit()).with_body(body);
+}
+
+fn env_int(name: &String, fallback: Int, low: Int, high: Int) -> Result<Int, Int>
+  intent "Read one bounded integer setting; a malformed or out-of-range value is rejected."
+  requires none
+  ensures none
+  effects env
+{
+  match env.get(&name) {
+    Some(text) => {
+      match text.parse_int() {
+        Ok(value) => {
+          if value < low || value > high {
+            return Err(1);
+          }
+          return Ok(value);
+        }
+        Err(_) => {
+          return Err(1);
+        }
+      }
+    }
+    None => {
+      return Ok(fallback);
+    }
+  }
+}
+
+pub fn settings() -> Result<Settings, Int>
+  intent "Read every finite limit at startup and reject the whole configuration when one is out of range."
+  requires none
+  ensures none
+  effects env
+{
+  let deadline_ms = env_int(&"AEGIS_DEADLINE_MS", 10, 1, 10)?;
+  return Ok(Settings { max_connections: env_int(&"AEGIS_MAX_CONNECTIONS", 64, 1, 256)?, receive_ms: env_int(&"AEGIS_RECEIVE_TIMEOUT_MS", 30000, 100, 60000)?, connect_ms: env_int(&"AEGIS_UPSTREAM_CONNECT_TIMEOUT_MS", 10000, 100, 60000)?, relay_ms: env_int(&"AEGIS_UPSTREAM_RELAY_TIMEOUT_MS", 30000, 100, 120000)?, body_limit: env_int(&"AEGIS_UPSTREAM_BODY_LIMIT", body_limit_max(), 1, body_limit_max())?, deadline_ns: deadline_ms * 1000000, node_rate: env_int(&"AEGIS_NODE_RATE", 300, 1, 1000000)?, node_burst: env_int(&"AEGIS_NODE_BURST", 600, 1, 1000000)?, key_rate: env_int(&"AEGIS_KEY_RATE", 20, 1, 1000000)?, key_burst: env_int(&"AEGIS_KEY_BURST", 40, 1, 1000000)?, table_capacity: env_int(&"AEGIS_RATE_TABLE", 256, 1, 4096)? });
+}
+
+pub fn memory_ceiling(budget: &Settings) -> Int
+  intent "Worst-case bytes held by requests in flight: head, request bytes and the forwarded copy, plus a task allowance."
+  requires none
+  ensures none
+  effects none
+{
+  return budget.max_connections * (head_limit() + 2 * budget.body_limit + 131072);
+}
+
+pub fn begin_at(started: Int, budget: Int) -> Inspection
+  intent "Start an inspection from a monotonic reading; tests inject the reading."
+  requires none
+  ensures none
+  effects none
+{
+  return Inspection { started: started, budget: budget, checks: 0 };
+}
+
+pub fn begin(budget: Int) -> Option<Inspection>
+  intent "Start an inspection now; without a monotonic clock nothing is inspected."
+  requires none
+  ensures none
+  effects clock
+{
+  return match clock.monotonic_nanos() {
+    Some(now) => Some(begin_at(now, budget)),
+    None => None,
+  };
+}
+
+pub fn expired(watch: &mut Inspection) -> Bool
+  intent "Check the monotonic deadline at the start, at each work unit boundary and before forwarding."
+  requires none
+  ensures none
+  effects clock
+{
+  watch.checks = watch.checks + 1;
+  return match clock.monotonic_nanos() {
+    Some(now) => now - watch.started > watch.budget,
+    None => true,
+  };
+}
+
+pub fn elapsed(watch: &Inspection) -> Int
+  intent "Nanoseconds since the inspection started, zero when the clock is unavailable."
+  requires none
+  ensures none
+  effects clock
+{
+  match clock.monotonic_nanos() {
+    Some(now) => {
+      if now > watch.started {
+        return now - watch.started;
+      }
+    }
+    None => {}
+  }
+  return 0;
+}
+
+pub fn policy_chunks(policy: &Policy) -> Result<List<Policy>, Int>
+  intent "Split the rules into bounded work units; a rule set above the accepted count is rejected."
+  requires none
+  ensures none
+  effects none
+{
+  let rules = policy.rules();
+  if rules.len() > max_rules() {
+    return Err(1);
+  }
+  let mut chunks = List.new();
+  let mut group = List.new();
+  let mut i = 0;
+  while i < rules.len() {
+    match rules.get(i) {
+      Some(rule) => {
+        group.push(rule.clone());
+      }
+      None => {}
+    }
+    if group.len() == rules_per_unit() {
+      chunks.push(Policy.new(policy.version(), group));
+      group = List.new();
+    }
+    i = i + 1;
+  }
+  if group.len() > 0 || chunks.len() == 0 {
+    chunks.push(Policy.new(policy.version(), group));
+  }
+  return Ok(chunks);
+}
+
+pub fn stronger(best: Decision, next: Decision) -> Decision
+  intent "Keep the earlier decision unless a later work unit found a strictly stronger action."
+  requires none
+  ensures none
+  effects none
+{
+  if action_rank(&next.action()) > action_rank(&best.action()) {
+    return next;
+  }
+  return best;
+}
