@@ -236,77 +236,6 @@ def run_single_target(target_id: int, duration_secs: int = 3605):
     }
     return result
 
-def wait_for_running_target_0():
-    """既に起動中の Target 0 プロセス（PID 18545, 18546）の完了を待機する"""
-    pid_eval = 18545
-    pid_native = 18546
-    eval_log = WORK_DIR / "target_0_evaluator.log"
-    native_log = WORK_DIR / "target_0_native.log"
-    t_start = 1764304603.0  # 04:36:43 UTC
-
-    log(f"既存の Target 0 実行プロセス（PID: {pid_eval}, {pid_native}）を検出。完了を待機します...")
-
-    def is_alive(pid):
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
-    last_log = time.time()
-    while is_alive(pid_eval) or is_alive(pid_native):
-        time.sleep(10)
-        now = time.time()
-        if now - last_log >= 60:
-            elapsed = now - t_start
-            e_st = "RUNNING" if is_alive(pid_eval) else "EXITED"
-            n_st = "RUNNING" if is_alive(pid_native) else "EXITED"
-            log(f"[{elapsed:6.1f}s / 3605s] Target 0 (ポリシー JSON) | 評価器: {e_st} | ネイティブ: {n_st}")
-            last_log = now
-
-    t_end = time.time()
-    wall_elapsed = t_end - t_start
-    log(f"既存 Target 0 プロセス完了 (所要時間: {wall_elapsed:.2f}s)")
-
-    eval_out = eval_log.read_text(encoding="utf-8", errors="replace")
-    native_out = native_log.read_text(encoding="utf-8", errors="replace")
-
-    e_ok, e_iters, e_ns = parse_output(eval_out)
-    n_ok, n_iters, n_ns = parse_output(native_out)
-
-    e_res = {
-        "mode": "evaluator",
-        "returncode": 0 if e_ok else 1,
-        "success": e_ok,
-        "iterations": e_iters,
-        "elapsed_seconds": e_ns / 1e9 if e_ns > 0 else wall_elapsed,
-        "wall_time_seconds": wall_elapsed,
-        "crashes": 0 if e_ok else 1,
-        "hangs": 0,
-        "seed": TARGET_SEEDS[0][0],
-    }
-    n_res = {
-        "mode": "native",
-        "returncode": 0 if n_ok else 1,
-        "success": n_ok,
-        "iterations": n_iters,
-        "elapsed_seconds": n_ns / 1e9 if n_ns > 0 else wall_elapsed,
-        "wall_time_seconds": wall_elapsed,
-        "crashes": 0 if n_ok else 1,
-        "hangs": 0,
-        "seed": TARGET_SEEDS[0][1],
-    }
-    return {
-        "target_id": 0,
-        "target_name": TARGETS[0]["name"],
-        "slug": TARGETS[0]["slug"],
-        "evaluator": e_res,
-        "native": n_res,
-        "start_time": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(t_start)),
-        "end_time": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(t_end)),
-        "wall_time_seconds": wall_elapsed,
-    }
-
 def main():
     log("==================================================")
     log("Aegis WAF 長時間ファジング・オーケストレーター起動")
@@ -323,48 +252,8 @@ def main():
         except Exception:
             all_results = {}
 
-    # Target 0: 既存プロセスがあれば待機、なければ実行
-    if 0 not in all_results:
-        # Check if PID 18545 or 18546 is alive
-        pid_alive = False
-        for pid in [18545, 18546]:
-            try:
-                os.kill(pid, 0)
-                pid_alive = True
-            except OSError:
-                pass
-        if pid_alive:
-            res_0 = wait_for_running_target_0()
-        else:
-            res_0 = run_single_target(0, duration_secs=3605)
-
-        all_results[0] = res_0
-        results_list = [all_results[k] for k in sorted(all_results.keys())]
-        with open(RESULTS_JSON, "w", encoding="utf-8") as f:
-            json.dump(results_list, f, indent=2, ensure_ascii=False)
-        update_record_document(results_list)
-
-        # 進捗コメント投稿
-        body = f"""## 進捗報告: 対象 0（ポリシー JSON）の長時間ファジング完了
-
-- **対象**: ポリシー JSON（Target 0）
-- **所要時間**:
-  - 評価器: {res_0['evaluator']['elapsed_seconds']:.2f} 秒
-  - ネイティブ: {res_0['native']['elapsed_seconds']:.2f} 秒
-  - 壁時計時間: {res_0['wall_time_seconds']:.2f} 秒
-- **実行回数**:
-  - 評価器: {res_0['evaluator']['iterations']:,} 回
-  - ネイティブ: {res_0['native']['iterations']:,} 回
-  - 合計: {res_0['evaluator']['iterations'] + res_0['native']['iterations']:,} 回
-- **初期シード**: 評価器 {res_0['evaluator']['seed']} / ネイティブ {res_0['native']['seed']}（実行中 10,000 回ごとにシード自動更新）
-- **クラッシュ／ハング**: 0 件
-- **性質違反**: 0 件
-- **判定**: **合格**
-"""
-        post_comment(body)
-
-    # Target 1 から 4 を順次実行
-    for t_id in range(1, 5):
+    # Target 0 から 4 を順次実行
+    for t_id in range(5):
         if t_id in all_results:
             log(f"Target {t_id} は既に完了しているためスキップします。")
             continue
